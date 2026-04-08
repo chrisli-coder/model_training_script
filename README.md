@@ -11,6 +11,7 @@
 - **模型**：因果 Transformer（与常见 nanoGPT 结构一致），支持 `dropout`、`bias`、权重初始化与参数量打印。
 - **训练**：AdamW、**warmup + 余弦**学习率至 `min_lr`、**梯度裁剪**、可选 **CUDA AMP**；每步可记录 **梯度 L2 范数**（`grad_norm`）。
 - **评估与日志**：按 `eval_interval` 在验证集上算 `val_loss` / perplexity；`log_backend` 可选 `none` | `tensorboard` | `wandb`。
+- **控制台进度行**（每次 eval）：固定宽度的 `Step …/max_iters | 百分比`、ASCII 进度条（如 `[====>---------------]`）、`train_loss` / `val_loss` / `grad_norm` / `ppl` / `lr`；**`d_tr` / `d_va`** 为相对**上一次 eval** 的 loss 差值（首轮为 `n/a`，变好为负）；**`s/it`** 为相邻两次 eval 之间的耗时除以步数，近似每训练步秒数。TensorBoard/WandB 同步标量：`train/loss_delta`、`val/loss_delta`、`train/secs_per_iter`。训练结束时的 **`Eval history`** 汇总使用相同列对齐，为缩短行宽**不**重复进度条。
 - **断点**：`checkpoint_interval` 写 `latest.pt`，验证改善写 `best.pt`；含 model / optimizer / scaler / RNG 等（含 NumPy RNG，加载时使用 `weights_only=False` 以兼容 PyTorch 2.6+）。
 - **续训**：`--resume`，默认从 `out_dir/latest.pt` 恢复，或用 `--checkpoint` 指定路径。
 - **早停**：`early_stop_patience > 0` 时，连续若干次验证未提升则结束。

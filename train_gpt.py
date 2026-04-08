@@ -682,6 +682,66 @@ class LoggerBackend:
             wandb.finish()
 
 
+PROGRESS_BAR_INNER_WIDTH = 20
+
+
+def build_ascii_progress_bar(step: int, max_iters: int, inner_width: int = PROGRESS_BAR_INNER_WIDTH) -> str:
+    """[====>---------------] style bar; inner_width counts characters between [ and ]."""
+    if inner_width < 2:
+        return "[]"
+    if max_iters <= 0:
+        return "[" + "-" * (inner_width - 1) + "]"
+    frac = min(1.0, max(0.0, float(step) / float(max_iters)))
+    n_pos = inner_width - 1
+    filled = int(round(frac * n_pos))
+    filled = min(max(filled, 0), n_pos)
+    eq = "=" * filled
+    dash = "-" * (n_pos - filled)
+    return f"[{eq}>{dash}]"
+
+
+def _delta_cell(prev: Optional[float], cur: float) -> tuple[Optional[float], str]:
+    """Return (numeric delta or None, fixed-width display string)."""
+    if prev is None or cur != cur or prev != prev:
+        return None, "   n/a "
+    d = cur - prev
+    return d, f"{d:+8.4f}"
+
+
+def _s_per_it_str(s_per_it: Optional[float]) -> str:
+    if s_per_it is None or (s_per_it != s_per_it):
+        return "  n/a s/it"
+    return f"{s_per_it:6.2f}s/it"
+
+
+def format_eval_log_line(
+    step: int,
+    max_iters: int,
+    train_loss: float,
+    val_loss: float,
+    grad_norm: float,
+    ppl: float,
+    lr: float,
+    d_tr_str: str,
+    d_va_str: str,
+    s_per_it_disp: str,
+    *,
+    include_bar: bool = True,
+) -> str:
+    w = max(1, len(str(max_iters)))
+    pct = (100.0 * step / max_iters) if max_iters > 0 else 0.0
+    head = f"[Step {step:{w}d}/{max_iters} | {pct:5.1f}%]"
+    if include_bar:
+        head += " " + build_ascii_progress_bar(step, max_iters)
+    body = (
+        "  "
+        f"train_loss: {train_loss:.4f}  val_loss: {val_loss:.4f}  "
+        f"d_tr: {d_tr_str}  d_va: {d_va_str}  "
+        f"grad_norm: {grad_norm:6.2f}  ppl: {ppl:7.2f}  lr: {lr:.2e}  {s_per_it_disp}"
+    )
+    return head + body
+
+
 def _config_groups() -> dict[str, list[str]]:
     return {
         "infrastructure": [
@@ -903,6 +963,10 @@ def main(args: argparse.Namespace) -> None:
     bad_epochs = 0
     t0 = time.time()
     eval_records: List[dict[str, Any]] = []
+    prev_train_loss: Optional[float] = None
+    prev_val_loss: Optional[float] = None
+    last_eval_wall: Optional[float] = None
+    last_eval_step: Optional[int] = None
 
     try:
         while step < cfg.max_iters:
@@ -920,10 +984,30 @@ def main(args: argparse.Namespace) -> None:
                 val_loss = evaluate(model, val_loader, device)
                 ppl = math.exp(val_loss) if val_loss == val_loss else float("nan")
                 elapsed = time.time() - t0
-                print(
-                    f"[step {step}/{cfg.max_iters}] train_loss={loss_tr:.4f} grad_norm={grad_norm:.4f} "
-                    f"val_loss={val_loss:.4f} ppl={ppl:.2f} lr={lr_now:.2e} ({elapsed:.1f}s)"
+                now_wall = time.time()
+                if last_eval_wall is None:
+                    s_per_it = elapsed / max(1, step + 1)
+                else:
+                    dt_wall = now_wall - last_eval_wall
+                    d_st = step - last_eval_step if last_eval_step is not None else step
+                    s_per_it = dt_wall / max(1, d_st)
+                d_tr_num, d_tr_str = _delta_cell(prev_train_loss, loss_tr)
+                d_va_num, d_va_str = _delta_cell(prev_val_loss, val_loss)
+                spd = _s_per_it_str(s_per_it)
+                line = format_eval_log_line(
+                    step,
+                    cfg.max_iters,
+                    loss_tr,
+                    val_loss,
+                    grad_norm,
+                    ppl,
+                    lr_now,
+                    d_tr_str,
+                    d_va_str,
+                    spd,
+                    include_bar=True,
                 )
+                print(line)
                 eval_records.append(
                     {
                         "step": step,
@@ -933,18 +1017,28 @@ def main(args: argparse.Namespace) -> None:
                         "ppl": ppl,
                         "lr": lr_now,
                         "elapsed_s": elapsed,
+                        "d_train": d_tr_num,
+                        "d_val": d_va_num,
+                        "d_tr_str": d_tr_str,
+                        "d_va_str": d_va_str,
+                        "s_per_it": s_per_it,
                     }
                 )
-                logger.log_scalars(
-                    step,
-                    {
-                        "train/loss": loss_tr,
-                        "train/grad_norm": grad_norm,
-                        "val/loss": val_loss,
-                        "val/perplexity": ppl,
-                        "train/lr": lr_now,
-                    },
-                )
+                metrics: dict[str, float] = {
+                    "train/loss": loss_tr,
+                    "train/grad_norm": grad_norm,
+                    "val/loss": val_loss,
+                    "val/perplexity": ppl,
+                    "train/lr": lr_now,
+                    "train/secs_per_iter": float(s_per_it),
+                }
+                if d_tr_num is not None and (d_tr_num == d_tr_num):
+                    metrics["train/loss_delta"] = float(d_tr_num)
+                if d_va_num is not None and (d_va_num == d_va_num):
+                    metrics["val/loss_delta"] = float(d_va_num)
+                logger.log_scalars(step, metrics)
+                prev_train_loss, prev_val_loss = loss_tr, val_loss
+                last_eval_wall, last_eval_step = now_wall, step
                 if val_loss < best_val_loss - 1e-6:
                     best_val_loss = val_loss
                     bad_epochs = 0
@@ -1010,8 +1104,19 @@ def main(args: argparse.Namespace) -> None:
     print("\n=== Eval history (every eval_interval) ===")
     for r in eval_records:
         print(
-            f"  step={r['step']:<6} train_loss={r['train_loss']:.4f} grad_norm={r['grad_norm']:.4f} "
-            f"val_loss={r['val_loss']:.4f} ppl={r['ppl']:.2f} lr={r['lr']:.2e} elapsed_s={r['elapsed_s']:.1f}s"
+            format_eval_log_line(
+                int(r["step"]),
+                cfg.max_iters,
+                float(r["train_loss"]),
+                float(r["val_loss"]),
+                float(r["grad_norm"]),
+                float(r["ppl"]),
+                float(r["lr"]),
+                str(r.get("d_tr_str", "   n/a ")),
+                str(r.get("d_va_str", "   n/a ")),
+                _s_per_it_str(r.get("s_per_it") if r.get("s_per_it") is not None else None),
+                include_bar=False,
+            )
         )
     print(f"\n[done] last_step={step} best_val_loss={best_val_loss:.4f} eval_points={len(eval_records)}")
 
