@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+__version__ = "0.1.0"
+__author__ = "Chris Li"
+
 import argparse
 import dataclasses
 import math
@@ -74,8 +77,13 @@ def _coerce_field_value(raw: Any, hint: type) -> Any:
 
 
 def parse_cli() -> argparse.Namespace:
-    """CLI only (stdlib). Safe before numpy/torch/yaml so `-h` works with minimal deps."""
-    p = argparse.ArgumentParser(description="Single-file GPT trainer")
+    """CLI only (stdlib). Safe before numpy/torch/yaml so `-h` / `--version` work with minimal deps."""
+    p = argparse.ArgumentParser(description=f"Single-file GPT trainer (v{__version__}, {__author__})")
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__} (author: {__author__})",
+    )
     p.add_argument("--config", type=str, default="", help="YAML config path")
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--num_threads", type=int, default=None)
@@ -115,8 +123,8 @@ def parse_cli() -> argparse.Namespace:
     return p.parse_args()
 
 
-# Help / -h before heavy imports so `python3 train_gpt.py -h` works without numpy/torch.
-if __name__ == "__main__" and ("-h" in sys.argv or "--help" in sys.argv):
+# Help / version before heavy imports (no numpy/torch required).
+if __name__ == "__main__" and ("-h" in sys.argv or "--help" in sys.argv or "--version" in sys.argv):
     parse_cli()
 
 import numpy as np
@@ -742,6 +750,8 @@ def print_startup_report(
         for k in stray:
             lines.append(f"  {k}: {flat[k]!r}")
     lines.append("=== Runtime ===")
+    lines.append(f"  script_version: {__version__!r}")
+    lines.append(f"  script_author: {__author__!r}")
     lines.append(f"  python_version: {sys.version.split()[0]!r}")
     lines.append(f"  sys_version_one_line: {sys.version.strip()!r}")
     lines.append(f"  torch_version: {runtime.get('torch_version', 'n/a')!r}")
