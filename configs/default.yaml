@@ -1,0 +1,41 @@
+# Default hyperparameters — CLI overrides these values when the same flag is passed.
+
+device: auto
+num_threads: 0
+seed: 1337
+
+batch_size: 64
+lr: 0.0003
+max_iters: 5000
+weight_decay: 0.1
+warmup_iters: 200
+min_lr: 0.00001
+grad_clip: 1.0
+
+n_layer: 6
+n_head: 6
+n_embd: 384
+block_size: 256
+dropout: 0.0
+bias: true
+
+data_dir: data
+train_ratio: 0.9
+val_ratio: 0.1
+tokenizer: char
+tiktoken_encoding: gpt2
+
+out_dir: runs/out
+eval_interval: 500
+checkpoint_interval: 500
+early_stop_patience: 0
+
+sample_interval: 500
+sample_prompt: ""
+sample_max_new_tokens: 200
+append_samples_to_file: true
+
+log_backend: none
+num_workers: 0
+pin_memory: true
+amp: false

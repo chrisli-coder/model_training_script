@@ -1,0 +1,10 @@
+# Core: install a torch build that matches your platform (CPU / CUDA) from https://pytorch.org
+torch>=2.0
+numpy>=1.20
+PyYAML>=6.0
+tqdm>=4.60
+
+# Optional (train_gpt.py checks at runtime when you enable the feature):
+# tiktoken>=0.5      # --tokenizer tiktoken
+# tensorboard        # --log_backend tensorboard
+# wandb              # --log_backend wandb
