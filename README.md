@@ -1,54 +1,54 @@
 # model_training_script
 
-单文件 **nanoGPT 风格**语言模型训练脚本：**`train_gpt.py`**（约千行，内部分区模块化）。作者与版本见脚本内 `__author__` / `__version__`，或通过 `--version` 查看。
+A **single-file**, nanoGPT-style language model trainer: **`train_gpt.py`** (~1k lines, internally split into logical sections). Author and version are defined at the top of the script as `__author__` and `__version__`, or run `python train_gpt.py --version`.
 
-## 功能概览
+## Features
 
-- **配置**：`TrainConfig` 默认值 → 可选 [`configs/default.yaml`](configs/default.yaml) → **命令行优先**；启动时写入 `out_dir/config_resolved.yaml`。
-- **环境**：启动前分阶段检查（Python、依赖包、`device` 与 CUDA/MPS、数据路径、可选 `tensorboard` / `wandb` / `tiktoken`）。
-- **数据**：`data_dir` 为**单个 `.txt` 文件**或**包含若干 `.txt` 的目录**（UTF-8）；按 `train_ratio` / `val_ratio` 切分序列。
-- **Tokenizer**：默认**字符级**；`--tokenizer tiktoken` 时需安装 `tiktoken`（`tiktoken_encoding` 默认可为 `gpt2`）。
-- **模型**：因果 Transformer（与常见 nanoGPT 结构一致），支持 `dropout`、`bias`、权重初始化与参数量打印。
-- **训练**：AdamW、**warmup + 余弦**学习率至 `min_lr`、**梯度裁剪**、可选 **CUDA AMP**；每步可记录 **梯度 L2 范数**（`grad_norm`）。
-- **评估与日志**：按 `eval_interval` 在验证集上算 `val_loss` / perplexity；`log_backend` 可选 `none` | `tensorboard` | `wandb`。
-- **控制台进度行**（每次 eval）：固定宽度的 `Step …/max_iters | 百分比`、ASCII 进度条（如 `[====>---------------]`）、`train_loss` / `val_loss` / `grad_norm` / `ppl` / `lr`；**`d_tr` / `d_va`** 为相对**上一次 eval** 的 loss 差值（首轮为 `n/a`，变好为负）；**`s/it`** 为相邻两次 eval 之间的耗时除以步数，近似每训练步秒数。TensorBoard/WandB 同步标量：`train/loss_delta`、`val/loss_delta`、`train/secs_per_iter`。训练结束时的 **`Eval history`** 汇总使用相同列对齐，为缩短行宽**不**重复进度条。
-- **断点**：`checkpoint_interval` 写 `latest.pt`，验证改善写 `best.pt`；含 model / optimizer / scaler / RNG 等（含 NumPy RNG，加载时使用 `weights_only=False` 以兼容 PyTorch 2.6+）。
-- **续训**：`--resume`，默认从 `out_dir/latest.pt` 恢复，或用 `--checkpoint` 指定路径。
-- **早停**：`early_stop_patience > 0` 时，连续若干次验证未提升则结束。
-- **生成**：`sample_interval` 间隔下采样输出；可选写入 `out_dir/samples.txt`。
-- **收尾输出**：训练结束后打印 **`=== Eval history (every eval_interval) ===`** 汇总表。
-- **无重依赖时也可用**：`python train_gpt.py -h` / `--version` 在导入 PyTorch 之前即可退出（便于未装环境时查看帮助）。
+- **Configuration**: `TrainConfig` defaults → optional [`configs/default.yaml`](configs/default.yaml) → **CLI overrides win**; merged config is written to `out_dir/config_resolved.yaml` at startup.
+- **Environment**: Staged checks before training (Python version, required packages, `device` vs CUDA/MPS, data paths, optional `tensorboard` / `wandb` / `tiktoken`).
+- **Data**: `data_dir` is either a **single `.txt` file** or a **directory of `.txt` files** (UTF-8); sequence is split by `train_ratio` / `val_ratio`.
+- **Tokenizer**: **Character-level** by default; `--tokenizer tiktoken` requires `tiktoken` (default `tiktoken_encoding` e.g. `gpt2`).
+- **Model**: Causal Transformer (nanoGPT-style blocks), `dropout` / `bias`, init, and parameter counts printed at startup.
+- **Training**: AdamW, **warmup + cosine** LR schedule down to `min_lr`, **gradient clipping**, optional **CUDA AMP**; **L2 gradient norm** (`grad_norm`) logged each eval.
+- **Evaluation & logging**: `val_loss` / perplexity on a validation split every `eval_interval`; `log_backend` is `none` | `tensorboard` | `wandb`.
+- **Console progress line** (each eval): fixed-width `Step …/max_iters | percentage`, ASCII bar (e.g. `[====>---------------]`), `train_loss` / `val_loss` / `grad_norm` / `ppl` / `lr`; **`d_tr` / `d_va`** are loss deltas vs the **previous eval** (`n/a` on the first line; improvement is negative); **`s/it`** approximates seconds per training step from wall time between evals. TensorBoard/WandB also get `train/loss_delta`, `val/loss_delta`, `train/secs_per_iter`. The final **`Eval history`** block uses the same column layout **without** the progress bar to keep lines shorter.
+- **Checkpoints**: `checkpoint_interval` → `latest.pt`; improved validation → `best.pt`; includes model, optimizer, scaler, RNG state (including NumPy); `torch.load(..., weights_only=False)` for full checkpoints on PyTorch 2.6+.
+- **Resume**: `--resume` loads `out_dir/latest.pt` by default, or `--checkpoint path`.
+- **Early stopping**: if `early_stop_patience > 0`, stop after that many evals without validation improvement.
+- **Sampling**: periodic text samples at `sample_interval`; optional append to `out_dir/samples.txt`.
+- **Summary**: after training, prints **`=== Eval history (every eval_interval) ===`**.
+- **Lightweight help**: `python train_gpt.py -h` / `--version` exit **before** importing PyTorch (works without a full ML env).
 
-## 环境要求
+## Requirements
 
-- **Python 3.9+**（脚本内环境检查以 3.9 为下限）。
-- 依赖见 [`requirements.txt`](requirements.txt)；**PyTorch** 请按 [官网](https://pytorch.org) 选择与本机 **CPU / CUDA** 匹配的轮子。
+- **Python 3.9+** (enforced in-script).
+- See [`requirements.txt`](requirements.txt). Install **PyTorch** for your **CPU or CUDA** stack from the [official site](https://pytorch.org).
 
-### 安装示例
+### Install
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-# 若需 GPU，请按 PyTorch 文档选择带 CUDA 的安装命令
+# For GPU, follow PyTorch docs for the CUDA build you need
 ```
 
-可选：
+Optional extras:
 
 ```bash
 pip install tiktoken tensorboard wandb
 ```
 
-## 快速开始
+## Quick start
 
-1. 准备语料，例如目录 `data/` 下多个 `.txt`，或单个文件：
+1. Prepare text data—a folder of `.txt` files or one file:
 
    ```bash
    mkdir -p data
-   # 将文本放入 data/*.txt 或指定 file.txt
+   # put *.txt under data/ or point --data_dir at one file
    ```
 
-2. 运行（示例覆盖部分超参）：
+2. Run (example overrides):
 
    ```bash
    python train_gpt.py \
@@ -59,56 +59,56 @@ pip install tiktoken tensorboard wandb
      --num_threads 8
    ```
 
-3. 查看帮助与版本（**无需**已安装 PyTorch 即可执行）：
+3. Help and version (**no PyTorch required**):
 
    ```bash
    python train_gpt.py --help
    python train_gpt.py --version
    ```
 
-## 常用参数说明
+## Common CLI flags
 
-| 类别 | 参数示例 | 含义 |
-|------|-----------|------|
-| 设备 | `--device auto\|cpu\|cuda\|mps` | `auto`：CUDA → MPS → CPU |
-| 训练 | `--batch_size` `--lr` `--max_iters` `--weight_decay` | 批大小、学习率、总步数、权重衰减 |
-| 调度 | `--warmup_iters` `--min_lr` | 预热与余弦终点学习率 |
-| 模型 | `--n_layer` `--n_head` `--n_embd` `--block_size` | 层数、头数、宽度、上下文长度 |
-| 数据 | `--data_dir` `--train_ratio` `--val_ratio` | 路径与序列切分比例 |
-| I/O | `--out_dir` `--eval_interval` `--checkpoint_interval` | 输出目录与评估/存盘频率 |
-| 续训 | `--resume` `--checkpoint path/to.pt` | 从检查点继续 |
-| 监控 | `--log_backend none\|tensorboard\|wandb` | 日志后端 |
-| 其它 | `--amp` `--early_stop_patience N` `--grad_clip` | 混合精度、早停、裁剪阈值 |
+| Area | Examples | Meaning |
+|------|----------|---------|
+| Device | `--device auto\|cpu\|cuda\|mps` | `auto`: CUDA → MPS → CPU |
+| Training | `--batch_size` `--lr` `--max_iters` `--weight_decay` | Batch size, LR, total steps, weight decay |
+| Schedule | `--warmup_iters` `--min_lr` | Warmup steps and cosine floor LR |
+| Model | `--n_layer` `--n_head` `--n_embd` `--block_size` | Depth, heads, width, context length |
+| Data | `--data_dir` `--train_ratio` `--val_ratio` | Path and split ratios |
+| I/O | `--out_dir` `--eval_interval` `--checkpoint_interval` | Output dir and log/checkpoint cadence |
+| Resume | `--resume` `--checkpoint path/to.pt` | Continue from checkpoint |
+| Logging | `--log_backend none\|tensorboard\|wandb` | Metrics backend |
+| Other | `--amp` `--early_stop_patience N` `--grad_clip` | AMP, early stop, clip norm |
 
-完整列表以 **`python train_gpt.py --help`** 为准；YAML 中的键名与 CLI 长选项对应（蛇形命名与字段名一致）。
+The full list is in **`python train_gpt.py --help`**. YAML keys match `TrainConfig` field names (snake_case).
 
-## 输出目录（`out_dir`）典型文件
+## Typical `out_dir` layout
 
-| 文件 | 说明 |
-|------|------|
-| `config_resolved.yaml` | 合并后的最终配置 |
-| `startup_log.txt` | 启动阶段完整报告（与控制台一致） |
-| `latest.pt` / `best.pt` | 最近一次 / 验证最优检查点 |
-| `samples.txt` | 若开启间隔采样且 `append_samples_to_file` |
-| `tb/` | `log_backend=tensorboard` 时的日志 |
+| Path | Description |
+|------|-------------|
+| `config_resolved.yaml` | Final merged configuration |
+| `startup_log.txt` | Startup report (same as stdout) |
+| `latest.pt` / `best.pt` | Latest / best validation checkpoint |
+| `samples.txt` | If sampling is on and `append_samples_to_file` |
+| `tb/` | TensorBoard logs when `log_backend=tensorboard` |
 
-## 项目结构（仓库内）
+## Repository layout
 
 ```
 model_training_script/
   README.md
-  train_gpt.py          # 唯一训练入口与实现
+  train_gpt.py          # single entrypoint and implementation
   requirements.txt
-  configs/default.yaml  # 可选默认超参
-  plan.md               # 设计/计划说明（若保留）
+  configs/default.yaml  # optional default hyperparameters
+  plan.md               # design notes (if kept)
 ```
 
-训练产物、虚拟环境等应由 [`.gitignore`](.gitignore) 排除，勿提交。
+Artifacts (runs, `.venv`, etc.) should stay ignored via [`.gitignore`](.gitignore)—do not commit them.
 
-## 许可证与贡献
+## License & contributing
 
-未随仓库附带许可证文件时，默认保留所有权利；若需开源请自行添加 `LICENSE`。
+If no `LICENSE` file is present, all rights are reserved; add a license if you open-source the project.
 
 ---
 
-版本与作者以 **`train_gpt.py` 顶部** `__version__`、`__author__` 为准。
+Canonical **version** and **author** values live at the top of **`train_gpt.py`** (`__version__`, `__author__`).
