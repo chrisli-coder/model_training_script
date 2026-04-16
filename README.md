@@ -6,10 +6,10 @@ A **single-file**, nanoGPT-style language model trainer: **`train_gpt.py`** (~1k
 
 - **Configuration**: `TrainConfig` defaults → optional [`configs/default.yaml`](configs/default.yaml) → **CLI overrides win**; merged config is written to `out_dir/config_resolved.yaml` at startup.
 - **Environment**: Staged checks before training (Python version, required packages, `device` vs CUDA/MPS, data paths, optional `tensorboard` / `wandb` / `tiktoken`).
-- **Data**: `data_dir` is either a **single `.txt` file** or a **directory of `.txt` files** (UTF-8); sequence is split by `train_ratio` / `val_ratio`.
-- **Tokenizer**: **Character-level** by default; `--tokenizer tiktoken` requires `tiktoken` (default `tiktoken_encoding` e.g. `gpt2`).
+- **Data**: supports raw UTF-8 text mode and pretokenized binary mode. Text mode reads a single `.txt` file or directory of `.txt` files; bin mode opens `train.bin` / `val.bin` with `np.memmap` so host memory stays roughly constant even for very large corpora.
+- **Tokenizer**: **Character-level** by default; also supports `--tokenizer tiktoken` and external `tokenizer.json` files. Char tokenization in bin mode can reuse a saved vocab via `--vocab_file`.
 - **Model**: Causal Transformer (nanoGPT-style blocks), `dropout` / `bias`, init, and parameter counts printed at startup.
-- **Training**: `AdamW` by default, optional `bitsandbytes` **`AdamW8bit`** via `--optimizer_name adamw8bit`, **warmup + cosine** LR schedule down to `min_lr`, **gradient clipping**, optional **CUDA AMP**; **L2 gradient norm** (`grad_norm`) logged each eval.
+- **Training**: `AdamW` by default, optional `bitsandbytes` **`AdamW8bit`** via `--optimizer_name adamw8bit`, **warmup + cosine** LR schedule down to `min_lr`, **gradient clipping**, configurable **gradient accumulation** via `--accumulation_steps`, optional **CUDA AMP**; **L2 gradient norm** (`grad_norm`) logged each eval.
 - **Memory saving**: optional **gradient checkpointing** (`--gradient_checkpointing`) reduces activation memory during training by recomputing each Transformer block in backward; optional **8-bit optimizer** reduces optimizer-state memory on supported CUDA setups.
 - **Evaluation & logging**: `val_loss` / perplexity on a validation split every `eval_interval`; `log_backend` is `none` | `tensorboard` | `wandb`.
 - **Console progress line** (each eval): fixed-width `Step …/max_iters | percentage`, ASCII bar (e.g. `[====>---------------]`), `train_loss` / `val_loss` / `grad_norm` / `ppl` / `lr`; **`d_tr` / `d_va`** are loss deltas vs the **previous eval** (`n/a` on the first line; improvement is negative); **`s/it`** approximates seconds per training step from wall time between evals. TensorBoard/WandB also get `train/loss_delta`, `val/loss_delta`, `train/secs_per_iter`. The final **`Eval history`** block uses the same column layout **without** the progress bar to keep lines shorter.
@@ -37,7 +37,7 @@ pip install -r requirements.txt
 Optional extras:
 
 ```bash
-pip install tiktoken tensorboard wandb bitsandbytes
+pip install tiktoken tokenizers tensorboard wandb bitsandbytes
 ```
 
 Notes:
@@ -47,11 +47,12 @@ Notes:
 
 ## Quick start
 
-1. Prepare text data—a folder of `.txt` files or one file:
+1. Prepare either raw text data or pretokenized binary data.
 
    ```bash
    mkdir -p data
-   # put *.txt under data/ or point --data_dir at one file
+   # text mode: put *.txt under data/ or point --data_dir at one file
+   # bin mode: create data/train.bin and data/val.bin with uint16/int32/int64 token ids
    ```
 
 2. Run (example overrides):
@@ -63,6 +64,19 @@ Notes:
      --out_dir runs/exp01 \
      --device auto \
      --num_threads 8
+   ```
+
+3. For large corpora, switch to memmap-backed bin mode:
+
+   ```bash
+   python train_gpt.py \
+     --data_dir data \
+     --data_format bin \
+     --tokenizer tokenizer.json \
+     --batch_size 2 \
+     --accumulation_steps 32 \
+     --gradient_checkpointing \
+     --amp
    ```
 
 3. Help and version (**no PyTorch required**):
@@ -78,9 +92,11 @@ Notes:
 |------|----------|---------|
 | Device | `--device auto\|cpu\|cuda\|mps` | `auto`: CUDA → MPS → CPU |
 | Training | `--batch_size` `--lr` `--max_iters` `--weight_decay` | Batch size, LR, total steps, weight decay |
+| Effective batch | `--accumulation_steps` | Number of microbatches per optimizer update |
 | Schedule | `--warmup_iters` `--min_lr` | Warmup steps and cosine floor LR |
 | Model | `--n_layer` `--n_head` `--n_embd` `--block_size` | Depth, heads, width, context length |
-| Data | `--data_dir` `--train_ratio` `--val_ratio` | Path and split ratios |
+| Data | `--data_dir` `--data_format text\|bin` `--train_bin` `--val_bin` `--token_dtype` | Raw text or memmap-backed token files |
+| Tokenizer | `--tokenizer char\|tiktoken\|path/to/tokenizer.json` `--vocab_file` | Tokenizer backend and optional saved char vocab |
 | I/O | `--out_dir` `--eval_interval` `--checkpoint_interval` | Output dir and log/checkpoint cadence |
 | Resume | `--resume` `--checkpoint path/to.pt` | Continue from checkpoint |
 | Logging | `--log_backend none\|tensorboard\|wandb` | Metrics backend |
@@ -101,6 +117,84 @@ The full list is in **`python train_gpt.py --help`**. YAML keys match `TrainConf
 | `tb/` | TensorBoard logs when `log_backend=tensorboard` |
 
 The startup report now also shows the requested optimizer, resolved optimizer after fallback, optimizer warning text, and whether gradient checkpointing is active.
+
+## Data Modes
+
+### Text mode
+
+Use the legacy workflow when corpora are small enough to tokenize in memory:
+
+```bash
+python train_gpt.py \
+  --data_dir data \
+  --data_format text \
+  --tokenizer char
+```
+
+`train_ratio` and `val_ratio` are only used in this mode.
+
+### Bin mode
+
+Use this for large datasets or limited RAM. The script opens `train.bin` and `val.bin` lazily with `np.memmap`.
+
+```bash
+python train_gpt.py \
+  --data_dir data \
+  --data_format bin \
+  --token_dtype uint16 \
+  --tokenizer tokenizer.json
+```
+
+If you prefer explicit paths:
+
+```bash
+python train_gpt.py \
+  --data_format bin \
+  --train_bin /path/to/train.bin \
+  --val_bin /path/to/val.bin \
+  --tokenizer tiktoken
+```
+
+For char tokenization in bin mode, pass a saved vocab file:
+
+```bash
+python train_gpt.py \
+  --data_format bin \
+  --tokenizer char \
+  --vocab_file char_vocab.txt
+```
+
+`char_vocab.txt` should contain the character set in token-id order. A JSON file with a top-level `chars` list is also accepted.
+
+## Hardware-oriented examples
+
+Laptop CUDA example with aggressive memory savings:
+
+```bash
+python train_gpt.py \
+  --data_dir ./dataset \
+  --data_format bin \
+  --tokenizer ./tokenizer_v1/tokenizer.json \
+  --n_layer 24 \
+  --n_embd 2048 \
+  --batch_size 2 \
+  --accumulation_steps 32 \
+  --gradient_checkpointing \
+  --optimizer_name adamw8bit \
+  --amp
+```
+
+CPU compatibility example:
+
+```bash
+python train_gpt.py \
+  --device cpu \
+  --data_dir ./dataset \
+  --data_format text \
+  --n_layer 6 \
+  --n_embd 384 \
+  --batch_size 16
+```
 
 ## Repository layout
 

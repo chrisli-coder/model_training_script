@@ -14,7 +14,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Iterator, List, Optional, Protocol, Sequence, Tuple, Union
 
 
 @dataclass
@@ -23,6 +23,7 @@ class TrainConfig:
     num_threads: int = 0
     seed: int = 1337
     batch_size: int = 64
+    accumulation_steps: int = 1
     lr: float = 3e-4
     max_iters: int = 5000
     weight_decay: float = 0.1
@@ -36,9 +37,14 @@ class TrainConfig:
     dropout: float = 0.0
     bias: bool = True
     data_dir: str = "data"
+    data_format: str = "text"
+    train_bin: str = ""
+    val_bin: str = ""
+    token_dtype: str = "uint16"
     train_ratio: float = 0.9
     val_ratio: float = 0.1
     tokenizer: str = "char"
+    vocab_file: str = ""
     tiktoken_encoding: str = "gpt2"
     out_dir: str = "runs/out"
     eval_interval: int = 500
@@ -92,6 +98,7 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--num_threads", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--accumulation_steps", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--max_iters", type=int, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
@@ -105,9 +112,14 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--dropout", type=float, default=None)
     p.add_argument("--bias", type=lambda x: str(x).lower() in ("1", "true", "yes"), default=None)
     p.add_argument("--data_dir", type=str, default=None)
+    p.add_argument("--data_format", type=str, default=None)
+    p.add_argument("--train_bin", type=str, default=None)
+    p.add_argument("--val_bin", type=str, default=None)
+    p.add_argument("--token_dtype", type=str, default=None)
     p.add_argument("--train_ratio", type=float, default=None)
     p.add_argument("--val_ratio", type=float, default=None)
     p.add_argument("--tokenizer", type=str, default=None)
+    p.add_argument("--vocab_file", type=str, default=None)
     p.add_argument("--tiktoken_encoding", type=str, default=None)
     p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--eval_interval", type=int, default=None)
@@ -234,6 +246,16 @@ def check_environment_phase_b(cfg: TrainConfig) -> torch.device:
         except ImportError:
             print("[fatal] tokenizer=tiktoken. pip install tiktoken", file=sys.stderr)
             sys.exit(1)
+    elif tok.endswith(".json"):
+        tok_path = Path(cfg.tokenizer).expanduser()
+        if not tok_path.is_file():
+            print("[fatal] tokenizer json missing:", tok_path, file=sys.stderr)
+            sys.exit(1)
+        try:
+            import tokenizers  # noqa: F401
+        except ImportError:
+            print("[fatal] tokenizer=*.json requires tokenizers. pip install tokenizers", file=sys.stderr)
+            sys.exit(1)
     opt_name = cfg.optimizer_name.lower().strip()
     if opt_name not in ("adamw", "adamw8bit"):
         print("[fatal] optimizer_name must be one of: adamw, adamw8bit", file=sys.stderr)
@@ -242,13 +264,41 @@ def check_environment_phase_b(cfg: TrainConfig) -> torch.device:
     if opt_fallback not in ("fallback", "strict"):
         print("[fatal] optimizer_fallback must be one of: fallback, strict", file=sys.stderr)
         sys.exit(1)
+    if cfg.accumulation_steps < 1:
+        print("[fatal] accumulation_steps must be >= 1", file=sys.stderr)
+        sys.exit(1)
+    data_format = cfg.data_format.lower().strip()
+    if data_format not in ("text", "bin"):
+        print("[fatal] data_format must be one of: text, bin", file=sys.stderr)
+        sys.exit(1)
+    if cfg.token_dtype.lower().strip() not in ("uint16", "int32", "int64"):
+        print("[fatal] token_dtype must be one of: uint16, int32, int64", file=sys.stderr)
+        sys.exit(1)
     data_path = Path(cfg.data_dir).expanduser()
-    if not data_path.exists():
-        print("[fatal] data_dir missing:", data_path, "device=", cfg.device, file=sys.stderr)
-        sys.exit(1)
-    if data_path.is_dir() and not list(data_path.glob("*.txt")):
-        print("[fatal] no .txt in:", data_path, file=sys.stderr)
-        sys.exit(1)
+    if data_format == "text":
+        if not data_path.exists():
+            print("[fatal] data_dir missing:", data_path, "device=", cfg.device, file=sys.stderr)
+            sys.exit(1)
+        if data_path.is_dir() and not list(data_path.glob("*.txt")):
+            print("[fatal] no .txt in:", data_path, file=sys.stderr)
+            sys.exit(1)
+    else:
+        train_bin = Path(cfg.train_bin).expanduser() if cfg.train_bin else data_path / "train.bin"
+        val_bin = Path(cfg.val_bin).expanduser() if cfg.val_bin else data_path / "val.bin"
+        if not train_bin.is_file():
+            print("[fatal] train bin missing:", train_bin, file=sys.stderr)
+            sys.exit(1)
+        if not val_bin.is_file():
+            print("[fatal] val bin missing:", val_bin, file=sys.stderr)
+            sys.exit(1)
+        if tok in ("char", "character") and not cfg.vocab_file:
+            print("[fatal] char tokenizer in bin mode requires --vocab_file", file=sys.stderr)
+            sys.exit(1)
+    if cfg.vocab_file:
+        vocab_path = Path(cfg.vocab_file).expanduser()
+        if not vocab_path.is_file():
+            print("[fatal] vocab_file missing:", vocab_path, file=sys.stderr)
+            sys.exit(1)
     return resolved
 
 
@@ -284,10 +334,24 @@ def restore_rng_state(state: dict[str, Any], device: torch.device) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
+class TokenizerLike(Protocol):
+    @property
+    def vocab_size(self) -> int: ...
+
+    def encode(self, s: str) -> List[int]: ...
+
+    def decode(self, ids: Sequence[int]) -> str: ...
+
+
 class CharTokenizer:
-    def __init__(self, text: str) -> None:
-        chars = sorted(set(text))
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
+    def __init__(self, text: Optional[str] = None, *, chars: Optional[Sequence[str]] = None) -> None:
+        if chars is not None:
+            ordered = list(chars)
+        elif text is not None:
+            ordered = sorted(set(text))
+        else:
+            raise ValueError("CharTokenizer requires text or chars")
+        self.stoi = {ch: i for i, ch in enumerate(ordered)}
         self.itos = {i: ch for ch, i in self.stoi.items()}
 
     @property
@@ -317,6 +381,24 @@ class TiktokenTokenizer:
         return self._enc.decode([int(i) for i in ids])
 
 
+class JsonTokenizerAdapter:
+    def __init__(self, tokenizer_path: str) -> None:
+        from tokenizers import Tokenizer
+
+        self._path = str(Path(tokenizer_path).expanduser())
+        self._tok = Tokenizer.from_file(self._path)
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self._tok.get_vocab_size())
+
+    def encode(self, s: str) -> List[int]:
+        return [int(x) for x in self._tok.encode(s).ids]
+
+    def decode(self, ids: Sequence[int]) -> str:
+        return self._tok.decode([int(i) for i in ids])
+
+
 def load_text_corpus(data_dir: str) -> Tuple[str, dict[str, Any]]:
     p = Path(data_dir).expanduser()
     meta: dict[str, Any] = {"paths": [], "num_files": 0}
@@ -333,51 +415,156 @@ def load_text_corpus(data_dir: str) -> Tuple[str, dict[str, Any]]:
     return "".join(parts), meta
 
 
-def build_tokenizer(kind: str, text: str, tiktoken_encoding: str) -> Union[CharTokenizer, TiktokenTokenizer]:
+def load_char_vocab(vocab_file: str) -> CharTokenizer:
+    p = Path(vocab_file).expanduser()
+    if p.suffix.lower() == ".json":
+        payload = yaml.safe_load(p.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and isinstance(payload.get("chars"), list):
+            return CharTokenizer(chars=[str(x) for x in payload["chars"]])
+        raise ValueError(f"JSON vocab file must contain a top-level 'chars' list: {p}")
+    raw = p.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    if lines and all(len(line) == 1 for line in lines):
+        chars = lines
+    else:
+        chars = list(raw[:-1] if raw.endswith("\n") else raw)
+    return CharTokenizer(chars=chars)
+
+
+def build_tokenizer(
+    kind: str,
+    *,
+    text: Optional[str],
+    tiktoken_encoding: str,
+    vocab_file: str = "",
+) -> TokenizerLike:
     k = kind.lower().strip()
     if k in ("char", "character"):
+        if vocab_file:
+            return load_char_vocab(vocab_file)
+        if text is None:
+            raise ValueError("char tokenizer requires raw text or vocab_file")
         return CharTokenizer(text)
     if k in ("tiktoken", "bpe"):
         return TiktokenTokenizer(tiktoken_encoding)
+    if k.endswith(".json"):
+        return JsonTokenizerAdapter(kind)
     raise ValueError(f"Unknown tokenizer: {kind}")
 
 
-class BlockDataset(Dataset):
-    def __init__(self, data: torch.Tensor, block_size: int) -> None:
-        if data.numel() <= block_size:
-            raise ValueError(f"Corpus too short for block_size={block_size} tokens={data.numel()}")
+TOKEN_DTYPES: dict[str, Any] = {
+    "uint16": np.uint16,
+    "int32": np.int32,
+    "int64": np.int64,
+}
+
+
+class TokenWindowDataset(Dataset):
+    def __init__(self, data: Union[np.ndarray, torch.Tensor], block_size: int, *, randomize: bool) -> None:
         self.data = data
         self.block_size = int(block_size)
-        usable = self.data.numel() - self.block_size
-        self._starts = list(range(0, usable, self.block_size))
+        self.randomize = bool(randomize)
+        self.length = int(len(data))
+        if self.length <= self.block_size:
+            raise ValueError(f"Corpus too short for block_size={block_size} tokens={self.length}")
+        self._max_start = self.length - self.block_size - 1
+        if self._max_start < 0:
+            raise ValueError(f"Corpus too short for block_size={block_size} tokens={self.length}")
+        self._starts = np.arange(self._max_start + 1, dtype=np.int64)
 
     def __len__(self) -> int:
-        return len(self._starts)
+        return int(self._starts.shape[0])
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        s = self._starts[idx]
-        chunk = self.data[s : s + self.block_size + 1]
-        x = chunk[:-1].to(dtype=torch.long)
-        y = chunk[1:].to(dtype=torch.long)
+        if self.randomize:
+            start = random.randint(0, self._max_start)
+        else:
+            start = int(self._starts[idx])
+        chunk = np.asarray(self.data[start : start + self.block_size + 1], dtype=np.int64)
+        x = torch.from_numpy(chunk[:-1].copy()).to(dtype=torch.long)
+        y = torch.from_numpy(chunk[1:].copy()).to(dtype=torch.long)
         return x, y
 
 
+def resolve_bin_paths(cfg: TrainConfig) -> Tuple[Path, Path]:
+    data_path = Path(cfg.data_dir).expanduser()
+    train_bin = Path(cfg.train_bin).expanduser() if cfg.train_bin else data_path / "train.bin"
+    val_bin = Path(cfg.val_bin).expanduser() if cfg.val_bin else data_path / "val.bin"
+    return train_bin, val_bin
+
+
+def load_bin_dataset(path: Path, token_dtype: str) -> np.memmap:
+    return np.memmap(path, dtype=TOKEN_DTYPES[token_dtype.lower().strip()], mode="r")
+
+
+def tokenize_text_corpus(text: str, tokenizer: TokenizerLike) -> np.ndarray:
+    return np.asarray([int(x) for x in tokenizer.encode(text)], dtype=np.int64)
+
+
+def prepare_datasets(
+    cfg: TrainConfig,
+    tokenizer: TokenizerLike,
+) -> Tuple[TokenWindowDataset, TokenWindowDataset, dict[str, Any], dict[str, Any]]:
+    data_format = cfg.data_format.lower().strip()
+    if data_format == "text":
+        text, corpus_meta = load_text_corpus(cfg.data_dir)
+        encoded = tokenize_text_corpus(text, tokenizer)
+        n = int(encoded.shape[0])
+        n_train = int(n * float(cfg.train_ratio))
+        n_val = int(n * float(cfg.val_ratio))
+        n_train = max(0, min(n_train, n))
+        n_val = max(0, min(n_val, n - n_train))
+        if n_train <= cfg.block_size or n_val <= cfg.block_size:
+            raise ValueError(f"Bad split n={n} n_train={n_train} n_val={n_val} block={cfg.block_size}")
+        train_data = encoded[:n_train]
+        val_data = encoded[n_train : n_train + n_val]
+        train_ds = TokenWindowDataset(train_data, cfg.block_size, randomize=True)
+        val_ds = TokenWindowDataset(val_data, cfg.block_size, randomize=False)
+        info = {
+            "n_tokens_total": n,
+            "n_train_tokens": int(train_data.shape[0]),
+            "n_val_tokens": int(val_data.shape[0]),
+            "train_blocks": len(train_ds),
+            "val_batches_est": None,
+        }
+        corpus_info = {
+            "corpus_num_chars": len(text),
+            "corpus_utf8_bytes": len(text.encode("utf-8")),
+            "corpus_meta": corpus_meta,
+        }
+        return train_ds, val_ds, info, corpus_info
+
+    train_bin, val_bin = resolve_bin_paths(cfg)
+    train_data = load_bin_dataset(train_bin, cfg.token_dtype)
+    val_data = load_bin_dataset(val_bin, cfg.token_dtype)
+    train_ds = TokenWindowDataset(train_data, cfg.block_size, randomize=True)
+    val_ds = TokenWindowDataset(val_data, cfg.block_size, randomize=False)
+    info = {
+        "n_tokens_total": int(len(train_data) + len(val_data)),
+        "n_train_tokens": int(len(train_data)),
+        "n_val_tokens": int(len(val_data)),
+        "train_blocks": len(train_ds),
+        "val_batches_est": None,
+    }
+    corpus_info = {
+        "corpus_num_chars": "n/a",
+        "corpus_utf8_bytes": "n/a",
+        "corpus_meta": {
+            "format": "bin",
+            "train_bin": str(train_bin),
+            "val_bin": str(val_bin),
+            "token_dtype": cfg.token_dtype,
+        },
+    }
+    return train_ds, val_ds, info, corpus_info
+
+
 def build_dataloaders(
-    cfg: TrainConfig, device: torch.device, encoded: torch.Tensor
+    cfg: TrainConfig, device: torch.device, train_ds: Dataset, val_ds: Dataset
 ) -> Tuple[DataLoader, DataLoader, dict[str, Any]]:
-    n = int(encoded.numel())
-    n_train = int(n * float(cfg.train_ratio))
-    n_val = int(n * float(cfg.val_ratio))
-    n_train = max(0, min(n_train, n))
-    n_val = max(0, min(n_val, n - n_train))
-    if n_train <= cfg.block_size or n_val <= cfg.block_size:
-        raise ValueError(f"Bad split n={n} n_train={n_train} n_val={n_val} block={cfg.block_size}")
-    train_data = encoded[:n_train].contiguous()
-    val_data = encoded[n_train : n_train + n_val].contiguous()
     pin = bool(cfg.pin_memory) and device.type == "cuda"
     pw = bool(cfg.num_workers > 0)
-    train_ds = BlockDataset(train_data, cfg.block_size)
-    val_ds = BlockDataset(val_data, cfg.block_size)
+    worker_init = seed_dataloader_worker if cfg.num_workers > 0 else None
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
@@ -385,6 +572,7 @@ def build_dataloaders(
         num_workers=cfg.num_workers,
         pin_memory=pin,
         persistent_workers=pw,
+        worker_init_fn=worker_init,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -394,12 +582,10 @@ def build_dataloaders(
         num_workers=cfg.num_workers,
         pin_memory=pin,
         persistent_workers=pw,
+        worker_init_fn=worker_init,
         drop_last=False,
     )
     info = {
-        "n_tokens_total": n,
-        "n_train_tokens": int(train_data.numel()),
-        "n_val_tokens": int(val_data.numel()),
         "train_blocks": len(train_ds),
         "val_batches_est": max(1, math.ceil(len(val_ds) / cfg.batch_size)),
     }
@@ -413,6 +599,17 @@ def batch_stream(loader: DataLoader) -> Iterator[Tuple[torch.Tensor, torch.Tenso
             yield next(it)
         except StopIteration:
             it = iter(loader)
+
+
+def seed_dataloader_worker(worker_id: int) -> None:
+    # Give each worker its own Python and NumPy RNG stream so random window
+    # sampling does not collapse to identical sequences across worker processes.
+    # PyTorch derives each worker's initial seed from a shared base seed plus
+    # worker_id. Fold worker_id in explicitly to make the per-worker contract
+    # obvious for Python's random and NumPy as well.
+    seed = (torch.initial_seed() + int(worker_id)) % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 class LayerNorm(nn.Module):
@@ -543,7 +740,14 @@ def learning_rate_for_step(cfg: TrainConfig, step: int) -> float:
 
 
 @torch.no_grad()
-def evaluate(model: GPT, val_loader: DataLoader, device: torch.device, max_batches: int = 50) -> float:
+def evaluate(
+    model: GPT,
+    val_loader: DataLoader,
+    device: torch.device,
+    *,
+    use_amp: bool = False,
+    max_batches: int = 50,
+) -> float:
     model.eval()
     losses: List[float] = []
     for i, (x, y) in enumerate(val_loader):
@@ -551,7 +755,11 @@ def evaluate(model: GPT, val_loader: DataLoader, device: torch.device, max_batch
             break
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        _, loss = model(x, y)
+        if use_amp and device.type == "cuda":
+            with torch.cuda.amp.autocast(device_type="cuda", dtype=torch.float16):
+                _, loss = model(x, y)
+        else:
+            _, loss = model(x, y)
         losses.append(float(loss.item()))
     model.train()
     return float(np.mean(losses)) if losses else float("nan")
@@ -568,32 +776,42 @@ def compute_grad_norm_l2(model: nn.Module) -> float:
 
 def train_step(
     model: GPT,
-    x: torch.Tensor,
-    y: torch.Tensor,
+    batch_iter: Iterator[Tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    pin_memory: bool,
     optimizer: torch.optim.Optimizer,
     scaler: Optional[torch.cuda.amp.GradScaler],
     cfg: TrainConfig,
 ) -> Tuple[float, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    if scaler is not None:
-        with torch.cuda.amp.autocast(device_type="cuda", dtype=torch.float16):
+    loss_total = 0.0
+    for _ in range(cfg.accumulation_steps):
+        x, y = next(batch_iter)
+        x = x.to(device, non_blocking=pin_memory)
+        y = y.to(device, non_blocking=pin_memory)
+        if scaler is not None:
+            with torch.cuda.amp.autocast(device_type="cuda", dtype=torch.float16):
+                _, loss = model(x, y)
+            loss_total += float(loss.item())
+            # Divide by accumulation_steps so the accumulated gradient matches the
+            # mean gradient of one larger effective batch, rather than scaling it up.
+            scaler.scale(loss / cfg.accumulation_steps).backward()
+        else:
             _, loss = model(x, y)
-        scaler.scale(loss).backward()
+            loss_total += float(loss.item())
+            (loss / cfg.accumulation_steps).backward()
+    if scaler is not None:
         scaler.unscale_(optimizer)
-        grad_norm = compute_grad_norm_l2(model)
-        if cfg.grad_clip and cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+    grad_norm = compute_grad_norm_l2(model)
+    if cfg.grad_clip and cfg.grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+    if scaler is not None:
         scaler.step(optimizer)
         scaler.update()
     else:
-        _, loss = model(x, y)
-        loss.backward()
-        grad_norm = compute_grad_norm_l2(model)
-        if cfg.grad_clip and cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
-    return float(loss.item()), float(grad_norm)
+    return float(loss_total / cfg.accumulation_steps), float(grad_norm)
 
 
 def build_optimizer(
@@ -644,7 +862,7 @@ def build_optimizer(
 @torch.no_grad()
 def generate_sample_text(
     model: GPT,
-    tokenizer: Union[CharTokenizer, TiktokenTokenizer],
+    tokenizer: TokenizerLike,
     device: torch.device,
     prompt: str,
     max_new_tokens: int,
@@ -819,6 +1037,7 @@ def _config_groups() -> dict[str, list[str]]:
             "num_threads",
             "seed",
             "tokenizer",
+            "vocab_file",
             "tiktoken_encoding",
             "log_backend",
             "num_workers",
@@ -828,6 +1047,7 @@ def _config_groups() -> dict[str, list[str]]:
         ],
         "training": [
             "batch_size",
+            "accumulation_steps",
             "lr",
             "max_iters",
             "weight_decay",
@@ -847,6 +1067,10 @@ def _config_groups() -> dict[str, list[str]]:
         "model": ["n_layer", "n_head", "n_embd", "block_size", "dropout", "bias"],
         "io": [
             "data_dir",
+            "data_format",
+            "train_bin",
+            "val_bin",
+            "token_dtype",
             "out_dir",
             "train_ratio",
             "val_ratio",
@@ -899,6 +1123,10 @@ def print_startup_report(
     else:
         lines.append("  cuda_device_name: n/a")
     lines.append(f"  data_dir_resolved: {str(Path(cfg.data_dir).expanduser())!r}")
+    if cfg.data_format.lower().strip() == "bin":
+        train_bin, val_bin = resolve_bin_paths(cfg)
+        lines.append(f"  train_bin_resolved: {str(train_bin)!r}")
+        lines.append(f"  val_bin_resolved: {str(val_bin)!r}")
     lines.append(f"  corpus_chars: {runtime.get('corpus_num_chars', 'n/a')}")
     lines.append(f"  corpus_utf8_bytes: {runtime.get('corpus_utf8_bytes', 'n/a')}")
     lines.append(f"  vocab_size: {runtime.get('vocab_size', 'n/a')}")
@@ -907,7 +1135,10 @@ def print_startup_report(
     lines.append(f"  n_train_tokens: {runtime.get('n_train_tokens', 'n/a')}")
     lines.append(f"  n_val_tokens: {runtime.get('n_val_tokens', 'n/a')}")
     lines.append(f"  pin_memory_effective: {runtime.get('pin_memory_effective', 'n/a')}")
+    lines.append(f"  amp_active: {runtime.get('amp_active', 'n/a')}")
     lines.append(f"  gradient_checkpointing_active: {runtime.get('gradient_checkpointing_active', 'n/a')}")
+    lines.append(f"  accumulation_steps: {runtime.get('accumulation_steps', 'n/a')}")
+    lines.append(f"  global_batch_tokens: {runtime.get('global_batch_tokens', 'n/a')}")
     lines.append(f"  model_n_layer: {cfg.n_layer}")
     lines.append(f"  model_n_head: {cfg.n_head}")
     lines.append(f"  model_n_embd: {cfg.n_embd}")
@@ -956,6 +1187,17 @@ def dump_resolved_config_yaml(cfg: TrainConfig, path: Path) -> None:
         yaml.safe_dump(asdict(cfg), f, sort_keys=True, allow_unicode=True)
 
 
+def tokenizer_runtime_name(cfg: TrainConfig, tokenizer: TokenizerLike) -> str:
+    kind = cfg.tokenizer.lower().strip()
+    if isinstance(tokenizer, CharTokenizer):
+        return "char"
+    if isinstance(tokenizer, TiktokenTokenizer):
+        return f"tiktoken({cfg.tiktoken_encoding})"
+    if kind.endswith(".json"):
+        return f"json({Path(cfg.tokenizer).name})"
+    return kind
+
+
 def main(args: argparse.Namespace) -> None:
     phase_a = check_environment_phase_a()
     cfg = TrainConfig()
@@ -980,12 +1222,19 @@ def main(args: argparse.Namespace) -> None:
         print("[warn] AMP needs CUDA; disabling AMP.", file=sys.stderr)
         cfg = dataclasses.replace(cfg, amp=False)
 
-    text, corpus_meta = load_text_corpus(cfg.data_dir)
-    tokenizer = build_tokenizer(cfg.tokenizer, text, cfg.tiktoken_encoding)
-    encoded = torch.tensor([int(x) for x in tokenizer.encode(text)], dtype=torch.long)
-    tok_name = "char" if isinstance(tokenizer, CharTokenizer) else f"tiktoken({cfg.tiktoken_encoding})"
-
-    train_loader, val_loader, split_info = build_dataloaders(cfg, device, encoded)
+    text_for_tokenizer: Optional[str] = None
+    if cfg.data_format.lower().strip() == "text" and cfg.tokenizer.lower().strip() in ("char", "character") and not cfg.vocab_file:
+        text_for_tokenizer, _ = load_text_corpus(cfg.data_dir)
+    tokenizer = build_tokenizer(
+        cfg.tokenizer,
+        text=text_for_tokenizer,
+        tiktoken_encoding=cfg.tiktoken_encoding,
+        vocab_file=cfg.vocab_file,
+    )
+    tok_name = tokenizer_runtime_name(cfg, tokenizer)
+    train_ds, val_ds, split_info, corpus_info = prepare_datasets(cfg, tokenizer)
+    train_loader, val_loader, loader_info = build_dataloaders(cfg, device, train_ds, val_ds)
+    split_info.update(loader_info)
     pin_effective = bool(cfg.pin_memory) and device.type == "cuda"
     model = GPT(cfg, tokenizer.vocab_size).to(device)
     try:
@@ -1018,19 +1267,20 @@ def main(args: argparse.Namespace) -> None:
     logger = LoggerBackend(cfg.log_backend, out_dir, run_name=out_dir.name)
     runtime: dict[str, Any] = {
         **phase_a,
-        "corpus_num_chars": len(text),
-        "corpus_utf8_bytes": len(text.encode("utf-8")),
+        **corpus_info,
         "vocab_size": tokenizer.vocab_size,
         "tokenizer_impl": tok_name,
         **split_info,
         "pin_memory_effective": pin_effective,
+        "amp_active": bool(cfg.amp),
         "gradient_checkpointing_active": bool(cfg.gradient_checkpointing),
+        "accumulation_steps": int(cfg.accumulation_steps),
+        "global_batch_tokens": int(cfg.batch_size * cfg.accumulation_steps * cfg.block_size),
         "num_parameters_total": count_parameters(model, False),
         "num_parameters_trainable": count_parameters(model, True),
         "optimizer_requested": cfg.optimizer_name,
         "optimizer_resolved": resolved_optimizer_name,
         "optimizer_warning": optimizer_warning or "",
-        "corpus_meta": corpus_meta,
     }
 
     print_startup_report(
@@ -1058,19 +1308,17 @@ def main(args: argparse.Namespace) -> None:
             for pg in optimizer.param_groups:
                 pg["lr"] = lr_now
 
-            x, y = next(train_iter)
+            loss_tr, grad_norm = train_step(model, train_iter, device, pin_effective, optimizer, scaler, cfg)
+            step += 1
             rng_state = collect_rng_state(device)
-            x = x.to(device, non_blocking=pin_effective)
-            y = y.to(device, non_blocking=pin_effective)
-            loss_tr, grad_norm = train_step(model, x, y, optimizer, scaler, cfg)
 
-            if step % cfg.eval_interval == 0 or step == 0:
-                val_loss = evaluate(model, val_loader, device)
+            if step % cfg.eval_interval == 0 or step == 1:
+                val_loss = evaluate(model, val_loader, device, use_amp=bool(cfg.amp))
                 ppl = math.exp(val_loss) if val_loss == val_loss else float("nan")
                 elapsed = time.time() - t0
                 now_wall = time.time()
                 if last_eval_wall is None:
-                    s_per_it = elapsed / max(1, step + 1)
+                    s_per_it = elapsed / max(1, step)
                 else:
                     dt_wall = now_wall - last_eval_wall
                     d_st = step - last_eval_step if last_eval_step is not None else step
@@ -1168,8 +1416,6 @@ def main(args: argparse.Namespace) -> None:
                     with (out_dir / "samples.txt").open("a", encoding="utf-8") as sf:
                         sf.write(banner)
                         sf.write(gen + "\n")
-
-            step += 1
     finally:
         save_checkpoint(
             out_dir / "latest.pt",
