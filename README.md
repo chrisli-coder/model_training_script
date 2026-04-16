@@ -9,7 +9,8 @@ A **single-file**, nanoGPT-style language model trainer: **`train_gpt.py`** (~1k
 - **Data**: `data_dir` is either a **single `.txt` file** or a **directory of `.txt` files** (UTF-8); sequence is split by `train_ratio` / `val_ratio`.
 - **Tokenizer**: **Character-level** by default; `--tokenizer tiktoken` requires `tiktoken` (default `tiktoken_encoding` e.g. `gpt2`).
 - **Model**: Causal Transformer (nanoGPT-style blocks), `dropout` / `bias`, init, and parameter counts printed at startup.
-- **Training**: AdamW, **warmup + cosine** LR schedule down to `min_lr`, **gradient clipping**, optional **CUDA AMP**; **L2 gradient norm** (`grad_norm`) logged each eval.
+- **Training**: `AdamW` by default, optional `bitsandbytes` **`AdamW8bit`** via `--optimizer_name adamw8bit`, **warmup + cosine** LR schedule down to `min_lr`, **gradient clipping**, optional **CUDA AMP**; **L2 gradient norm** (`grad_norm`) logged each eval.
+- **Memory saving**: optional **gradient checkpointing** (`--gradient_checkpointing`) reduces activation memory during training by recomputing each Transformer block in backward; optional **8-bit optimizer** reduces optimizer-state memory on supported CUDA setups.
 - **Evaluation & logging**: `val_loss` / perplexity on a validation split every `eval_interval`; `log_backend` is `none` | `tensorboard` | `wandb`.
 - **Console progress line** (each eval): fixed-width `Step …/max_iters | percentage`, ASCII bar (e.g. `[====>---------------]`), `train_loss` / `val_loss` / `grad_norm` / `ppl` / `lr`; **`d_tr` / `d_va`** are loss deltas vs the **previous eval** (`n/a` on the first line; improvement is negative); **`s/it`** approximates seconds per training step from wall time between evals. TensorBoard/WandB also get `train/loss_delta`, `val/loss_delta`, `train/secs_per_iter`. The final **`Eval history`** block uses the same column layout **without** the progress bar to keep lines shorter.
 - **Checkpoints**: `checkpoint_interval` → `latest.pt`; improved validation → `best.pt`; includes model, optimizer, scaler, RNG state (including NumPy); `torch.load(..., weights_only=False)` for full checkpoints on PyTorch 2.6+.
@@ -36,8 +37,13 @@ pip install -r requirements.txt
 Optional extras:
 
 ```bash
-pip install tiktoken tensorboard wandb
+pip install tiktoken tensorboard wandb bitsandbytes
 ```
+
+Notes:
+
+- `bitsandbytes` `AdamW8bit` is typically for **CUDA** training. On unsupported devices like `cpu` or `mps`, the script can either fall back to standard `AdamW` or fail early, depending on `--optimizer_fallback`.
+- Gradient checkpointing saves memory but usually increases compute time because activations are recomputed during backward.
 
 ## Quick start
 
@@ -78,6 +84,8 @@ pip install tiktoken tensorboard wandb
 | I/O | `--out_dir` `--eval_interval` `--checkpoint_interval` | Output dir and log/checkpoint cadence |
 | Resume | `--resume` `--checkpoint path/to.pt` | Continue from checkpoint |
 | Logging | `--log_backend none\|tensorboard\|wandb` | Metrics backend |
+| Optimizer | `--optimizer_name adamw\|adamw8bit` `--optimizer_fallback fallback\|strict` | Choose optimizer backend and unsupported-env behavior |
+| Memory | `--gradient_checkpointing` | Recompute Transformer blocks in backward to reduce activation memory |
 | Other | `--amp` `--early_stop_patience N` `--grad_clip` | AMP, early stop, clip norm |
 
 The full list is in **`python train_gpt.py --help`**. YAML keys match `TrainConfig` field names (snake_case).
@@ -91,6 +99,8 @@ The full list is in **`python train_gpt.py --help`**. YAML keys match `TrainConf
 | `latest.pt` / `best.pt` | Latest / best validation checkpoint |
 | `samples.txt` | If sampling is on and `append_samples_to_file` |
 | `tb/` | TensorBoard logs when `log_backend=tensorboard` |
+
+The startup report now also shows the requested optimizer, resolved optimizer after fallback, optimizer warning text, and whether gradient checkpointing is active.
 
 ## Repository layout
 

@@ -54,6 +54,9 @@ class TrainConfig:
     num_workers: int = 0
     pin_memory: bool = True
     amp: bool = False
+    gradient_checkpointing: bool = False
+    optimizer_name: str = "adamw"
+    optimizer_fallback: str = "fallback"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
 
@@ -120,6 +123,9 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--pin_memory", type=lambda x: str(x).lower() in ("1", "true", "yes"), default=None)
     p.add_argument("--amp", action="store_true", default=False)
+    p.add_argument("--gradient_checkpointing", action="store_true", default=False)
+    p.add_argument("--optimizer_name", type=str, default=None, help="adamw or adamw8bit")
+    p.add_argument("--optimizer_fallback", type=str, default=None, help="fallback or strict")
     return p.parse_args()
 
 
@@ -131,6 +137,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
@@ -227,6 +234,14 @@ def check_environment_phase_b(cfg: TrainConfig) -> torch.device:
         except ImportError:
             print("[fatal] tokenizer=tiktoken. pip install tiktoken", file=sys.stderr)
             sys.exit(1)
+    opt_name = cfg.optimizer_name.lower().strip()
+    if opt_name not in ("adamw", "adamw8bit"):
+        print("[fatal] optimizer_name must be one of: adamw, adamw8bit", file=sys.stderr)
+        sys.exit(1)
+    opt_fallback = cfg.optimizer_fallback.lower().strip()
+    if opt_fallback not in ("fallback", "strict"):
+        print("[fatal] optimizer_fallback must be one of: fallback, strict", file=sys.stderr)
+        sys.exit(1)
     data_path = Path(cfg.data_dir).expanduser()
     if not data_path.exists():
         print("[fatal] data_dir missing:", data_path, "device=", cfg.device, file=sys.stderr)
@@ -498,7 +513,10 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, device=idx.device, dtype=torch.long)
         x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
         for block in self.transformer.h:
-            x = block(x)
+            if self.cfg.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                x = activation_checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -578,6 +596,51 @@ def train_step(
     return float(loss.item()), float(grad_norm)
 
 
+def build_optimizer(
+    model: nn.Module, cfg: TrainConfig, device: torch.device
+) -> tuple[torch.optim.Optimizer, str, Optional[str]]:
+    requested = cfg.optimizer_name.lower().strip()
+    fallback_policy = cfg.optimizer_fallback.lower().strip()
+    warning: Optional[str] = None
+    resolved = requested
+
+    if requested == "adamw8bit":
+        if device.type != "cuda":
+            message = (
+                f"optimizer_name=adamw8bit requires CUDA, but resolved device is {device.type}. "
+                "Use --device cuda or switch optimizer_name to adamw."
+            )
+            if fallback_policy == "strict":
+                raise RuntimeError(message)
+            warning = "[warn] " + message + " Falling back to AdamW."
+            resolved = "adamw"
+        else:
+            try:
+                import bitsandbytes as bnb
+            except ImportError as exc:
+                message = "optimizer_name=adamw8bit requires bitsandbytes. pip install bitsandbytes"
+                if fallback_policy == "strict":
+                    raise RuntimeError(message) from exc
+                warning = f"[warn] {message}. Falling back to AdamW."
+                resolved = "adamw"
+            else:
+                optimizer = bnb.optim.AdamW8bit(
+                    model.parameters(),
+                    lr=cfg.lr,
+                    betas=(cfg.adam_beta1, cfg.adam_beta2),
+                    weight_decay=cfg.weight_decay,
+                )
+                return optimizer, resolved, warning
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        betas=(cfg.adam_beta1, cfg.adam_beta2),
+        weight_decay=cfg.weight_decay,
+    )
+    return optimizer, resolved, warning
+
+
 @torch.no_grad()
 def generate_sample_text(
     model: GPT,
@@ -642,7 +705,14 @@ def load_checkpoint(
     except TypeError:
         payload = torch.load(path, map_location=device)
     model.load_state_dict(payload["model"])
-    optimizer.load_state_dict(payload["optimizer"])
+    try:
+        optimizer.load_state_dict(payload["optimizer"])
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to restore optimizer state from checkpoint. "
+            "This can happen when resuming with a different optimizer backend "
+            "(for example AdamW vs AdamW8bit)."
+        ) from exc
     if scheduler is not None and payload.get("scheduler") is not None:
         scheduler.load_state_dict(payload["scheduler"])
     if scaler is not None and payload.get("scaler") is not None:
@@ -754,6 +824,7 @@ def _config_groups() -> dict[str, list[str]]:
             "num_workers",
             "pin_memory",
             "amp",
+            "gradient_checkpointing",
         ],
         "training": [
             "batch_size",
@@ -770,6 +841,8 @@ def _config_groups() -> dict[str, list[str]]:
             "early_stop_patience",
             "resume",
             "checkpoint",
+            "optimizer_name",
+            "optimizer_fallback",
         ],
         "model": ["n_layer", "n_head", "n_embd", "block_size", "dropout", "bias"],
         "io": [
@@ -834,12 +907,16 @@ def print_startup_report(
     lines.append(f"  n_train_tokens: {runtime.get('n_train_tokens', 'n/a')}")
     lines.append(f"  n_val_tokens: {runtime.get('n_val_tokens', 'n/a')}")
     lines.append(f"  pin_memory_effective: {runtime.get('pin_memory_effective', 'n/a')}")
+    lines.append(f"  gradient_checkpointing_active: {runtime.get('gradient_checkpointing_active', 'n/a')}")
     lines.append(f"  model_n_layer: {cfg.n_layer}")
     lines.append(f"  model_n_head: {cfg.n_head}")
     lines.append(f"  model_n_embd: {cfg.n_embd}")
     lines.append(f"  model_block_size: {cfg.block_size}")
     lines.append(f"  num_parameters_total: {runtime.get('num_parameters_total', 'n/a')}")
     lines.append(f"  num_parameters_trainable: {runtime.get('num_parameters_trainable', 'n/a')}")
+    lines.append(f"  optimizer_requested: {runtime.get('optimizer_requested', 'n/a')!r}")
+    lines.append(f"  optimizer_resolved: {runtime.get('optimizer_resolved', 'n/a')!r}")
+    lines.append(f"  optimizer_warning: {runtime.get('optimizer_warning', 'n/a')!r}")
     lines.append(f"  out_dir: {str(out_dir)!r}")
     lines.append(f"  checkpoint_latest_path: {str(out_dir / 'latest.pt')!r}")
     lines.append(f"  checkpoint_best_path: {str(out_dir / 'best.pt')!r}")
@@ -858,7 +935,7 @@ def apply_cli_to_config(cfg: TrainConfig, args: argparse.Namespace) -> TrainConf
     d = asdict(cfg)
     for ff in fields(TrainConfig):
         name = ff.name
-        if name in ("resume", "amp"):
+        if name in ("resume", "amp", "gradient_checkpointing"):
             continue
         v = getattr(args, name, None)
         if v is None:
@@ -868,6 +945,8 @@ def apply_cli_to_config(cfg: TrainConfig, args: argparse.Namespace) -> TrainConf
         d["resume"] = True
     if args.amp:
         d["amp"] = True
+    if args.gradient_checkpointing:
+        d["gradient_checkpointing"] = True
     return TrainConfig(**d)
 
 
@@ -909,12 +988,13 @@ def main(args: argparse.Namespace) -> None:
     train_loader, val_loader, split_info = build_dataloaders(cfg, device, encoded)
     pin_effective = bool(cfg.pin_memory) and device.type == "cuda"
     model = GPT(cfg, tokenizer.vocab_size).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.lr,
-        betas=(cfg.adam_beta1, cfg.adam_beta2),
-        weight_decay=cfg.weight_decay,
-    )
+    try:
+        optimizer, resolved_optimizer_name, optimizer_warning = build_optimizer(model, cfg, device)
+    except RuntimeError as exc:
+        print(f"[fatal] {exc}", file=sys.stderr)
+        sys.exit(1)
+    if optimizer_warning:
+        print(optimizer_warning, file=sys.stderr)
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
     scaler: Optional[torch.cuda.amp.GradScaler] = None
     if device.type == "cuda" and cfg.amp:
@@ -944,8 +1024,12 @@ def main(args: argparse.Namespace) -> None:
         "tokenizer_impl": tok_name,
         **split_info,
         "pin_memory_effective": pin_effective,
+        "gradient_checkpointing_active": bool(cfg.gradient_checkpointing),
         "num_parameters_total": count_parameters(model, False),
         "num_parameters_trainable": count_parameters(model, True),
+        "optimizer_requested": cfg.optimizer_name,
+        "optimizer_resolved": resolved_optimizer_name,
+        "optimizer_warning": optimizer_warning or "",
         "corpus_meta": corpus_meta,
     }
 
