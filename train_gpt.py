@@ -8,6 +8,7 @@ __author__ = "Chris Li"
 
 import argparse
 import dataclasses
+import io
 import math
 import random
 import sys
@@ -15,6 +16,11 @@ import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Iterator, List, Optional, Protocol, Sequence, Tuple, Union
+
+# Ensure terminal/sample prints are UTF-8 to avoid mojibake in misconfigured shells.
+_stdout_encoding = (sys.stdout.encoding or "").lower() if hasattr(sys.stdout, "encoding") else ""
+if _stdout_encoding != "utf-8" and hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
 @dataclass
@@ -46,6 +52,7 @@ class TrainConfig:
     tokenizer: str = "char"
     vocab_file: str = ""
     tiktoken_encoding: str = "gpt2"
+    force_byte_decode: bool = True
     out_dir: str = "runs/out"
     eval_interval: int = 500
     checkpoint_interval: int = 500
@@ -121,6 +128,12 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--tokenizer", type=str, default=None)
     p.add_argument("--vocab_file", type=str, default=None)
     p.add_argument("--tiktoken_encoding", type=str, default=None)
+    p.add_argument(
+        "--force_byte_decode",
+        type=lambda x: str(x).lower() in ("1", "true", "yes", "y", "on"),
+        default=None,
+        help="For BPE *.json tokenizers: set decoder to ByteLevel() so decode restores UTF-8 (default true; pass false/0 to disable)",
+    )
     p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--eval_interval", type=int, default=None)
     p.add_argument("--checkpoint_interval", type=int, default=None)
@@ -382,11 +395,17 @@ class TiktokenTokenizer:
 
 
 class JsonTokenizerAdapter:
-    def __init__(self, tokenizer_path: str) -> None:
-        from tokenizers import Tokenizer
+    def __init__(self, tokenizer_path: str, *, force_byte_decode: bool = True) -> None:
+        from tokenizers import Tokenizer, decoders
+        from tokenizers.models import BPE
 
         self._path = str(Path(tokenizer_path).expanduser())
         self._tok = Tokenizer.from_file(self._path)
+        self._force_byte_decode = bool(force_byte_decode)
+        # GPT-2-style BPE uses byte-level placeholders; HF's ByteLevel decoder restores UTF-8.
+        # Only attach for BPE so WordLevel JSON tokenizers (e.g. tests) keep their saved decoder.
+        if self._force_byte_decode and isinstance(self._tok.model, BPE):
+            self._tok.decoder = decoders.ByteLevel()
 
     @property
     def vocab_size(self) -> int:
@@ -437,6 +456,7 @@ def build_tokenizer(
     text: Optional[str],
     tiktoken_encoding: str,
     vocab_file: str = "",
+    force_byte_decode: bool = True,
 ) -> TokenizerLike:
     k = kind.lower().strip()
     if k in ("char", "character"):
@@ -448,7 +468,7 @@ def build_tokenizer(
     if k in ("tiktoken", "bpe"):
         return TiktokenTokenizer(tiktoken_encoding)
     if k.endswith(".json"):
-        return JsonTokenizerAdapter(kind)
+        return JsonTokenizerAdapter(kind, force_byte_decode=force_byte_decode)
     raise ValueError(f"Unknown tokenizer: {kind}")
 
 
@@ -458,6 +478,10 @@ TOKEN_DTYPES: dict[str, Any] = {
     "int64": np.int64,
 }
 
+# Training uses random windows in __getitem__; capping __len__ avoids DataLoader
+# (RandomSampler) building a corpus-sized index tensor (~8 bytes per window).
+RANDOM_WINDOW_DATASET_LEN = 10_000_000
+
 
 class TokenWindowDataset(Dataset):
     def __init__(self, data: Union[np.ndarray, torch.Tensor], block_size: int, *, randomize: bool) -> None:
@@ -465,21 +489,25 @@ class TokenWindowDataset(Dataset):
         self.block_size = int(block_size)
         self.randomize = bool(randomize)
         self.length = int(len(data))
-        if self.length <= self.block_size:
-            raise ValueError(f"Corpus too short for block_size={block_size} tokens={self.length}")
         self._max_start = self.length - self.block_size - 1
         if self._max_start < 0:
-            raise ValueError(f"Corpus too short for block_size={block_size} tokens={self.length}")
-        self._starts = np.arange(self._max_start + 1, dtype=np.int64)
+            raise ValueError("Corpus too short")
+
+    @property
+    def num_windows(self) -> int:
+        return int(self._max_start + 1)
 
     def __len__(self) -> int:
-        return int(self._starts.shape[0])
+        if self.randomize:
+            return int(RANDOM_WINDOW_DATASET_LEN)
+        return int(self._max_start + 1)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.randomize:
             start = random.randint(0, self._max_start)
         else:
-            start = int(self._starts[idx])
+            # shuffle=False val loader: idx is the window index (same as former np.arange)[idx]
+            start = int(idx)
         chunk = np.asarray(self.data[start : start + self.block_size + 1], dtype=np.int64)
         x = torch.from_numpy(chunk[:-1].copy()).to(dtype=torch.long)
         y = torch.from_numpy(chunk[1:].copy()).to(dtype=torch.long)
@@ -524,7 +552,7 @@ def prepare_datasets(
             "n_tokens_total": n,
             "n_train_tokens": int(train_data.shape[0]),
             "n_val_tokens": int(val_data.shape[0]),
-            "train_blocks": len(train_ds),
+            "train_blocks": train_ds.num_windows,
             "val_batches_est": None,
         }
         corpus_info = {
@@ -543,7 +571,7 @@ def prepare_datasets(
         "n_tokens_total": int(len(train_data) + len(val_data)),
         "n_train_tokens": int(len(train_data)),
         "n_val_tokens": int(len(val_data)),
-        "train_blocks": len(train_ds),
+        "train_blocks": train_ds.num_windows,
         "val_batches_est": None,
     }
     corpus_info = {
@@ -565,10 +593,12 @@ def build_dataloaders(
     pin = bool(cfg.pin_memory) and device.type == "cuda"
     pw = bool(cfg.num_workers > 0)
     worker_init = seed_dataloader_worker if cfg.num_workers > 0 else None
+    # shuffle=False: random windows come from TokenWindowDataset.__getitem__;
+    # shuffle=True would make RandomSampler materialize len(dataset) indices.
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=cfg.num_workers,
         pin_memory=pin,
         persistent_workers=pw,
@@ -586,7 +616,7 @@ def build_dataloaders(
         drop_last=False,
     )
     info = {
-        "train_blocks": len(train_ds),
+        "train_blocks": train_ds.num_windows,
         "val_batches_est": max(1, math.ceil(len(val_ds) / cfg.batch_size)),
     }
     return train_loader, val_loader, info
@@ -756,7 +786,7 @@ def evaluate(
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         if use_amp and device.type == "cuda":
-            with torch.cuda.amp.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                 _, loss = model(x, y)
         else:
             _, loss = model(x, y)
@@ -780,7 +810,7 @@ def train_step(
     device: torch.device,
     pin_memory: bool,
     optimizer: torch.optim.Optimizer,
-    scaler: Optional[torch.cuda.amp.GradScaler],
+    scaler: Optional[torch.amp.GradScaler],
     cfg: TrainConfig,
 ) -> Tuple[float, float]:
     model.train()
@@ -791,7 +821,7 @@ def train_step(
         x = x.to(device, non_blocking=pin_memory)
         y = y.to(device, non_blocking=pin_memory)
         if scaler is not None:
-            with torch.cuda.amp.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                 _, loss = model(x, y)
             loss_total += float(loss.item())
             # Divide by accumulation_steps so the accumulated gradient matches the
@@ -886,7 +916,7 @@ def save_checkpoint(
     model: GPT,
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
-    scaler: Optional[torch.cuda.amp.GradScaler],
+    scaler: Optional[torch.amp.GradScaler],
     step: int,
     best_val_loss: float,
     cfg: TrainConfig,
@@ -914,7 +944,7 @@ def load_checkpoint(
     model: GPT,
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
-    scaler: Optional[torch.cuda.amp.GradScaler],
+    scaler: Optional[torch.amp.GradScaler],
     device: torch.device,
 ) -> dict[str, Any]:
     # Full checkpoints include numpy RNG etc.; PyTorch 2.6+ defaults weights_only=True.
@@ -1039,6 +1069,7 @@ def _config_groups() -> dict[str, list[str]]:
             "tokenizer",
             "vocab_file",
             "tiktoken_encoding",
+            "force_byte_decode",
             "log_backend",
             "num_workers",
             "pin_memory",
@@ -1230,6 +1261,7 @@ def main(args: argparse.Namespace) -> None:
         text=text_for_tokenizer,
         tiktoken_encoding=cfg.tiktoken_encoding,
         vocab_file=cfg.vocab_file,
+        force_byte_decode=cfg.force_byte_decode,
     )
     tok_name = tokenizer_runtime_name(cfg, tokenizer)
     train_ds, val_ds, split_info, corpus_info = prepare_datasets(cfg, tokenizer)
@@ -1245,9 +1277,9 @@ def main(args: argparse.Namespace) -> None:
     if optimizer_warning:
         print(optimizer_warning, file=sys.stderr)
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
-    scaler: Optional[torch.cuda.amp.GradScaler] = None
+    scaler: Optional[torch.amp.GradScaler] = None
     if device.type == "cuda" and cfg.amp:
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler("cuda")
 
     step = 0
     best_val_loss = float("inf")

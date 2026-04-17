@@ -1,0 +1,26 @@
+# model architecture
+n_layer: 24
+n_head: 16
+n_embd: 2048
+block_size: 1024
+
+# VRAM and calculation of computing
+amp: True
+gradient_checkpointing: True
+optimizer_name: "adamw8bit"
+batch_size: 2
+accumulation_steps: 32  # same as Batch Size = 64
+
+# data and IO
+data_format: "bin"
+data_dir: "./dataset"
+tokenizer: "./tokenizer_v1/tokenizer.json"
+out_dir: "./runs/GPT1B_Final"
+
+# training control
+lr: 0.0003
+max_iters: 50000
+eval_interval: 200
+checkpoint_interval: 500
+sample_interval: 500
+sample_prompt: "女警突然"
