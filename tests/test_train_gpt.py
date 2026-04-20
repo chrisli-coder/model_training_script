@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -18,6 +19,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import train_gpt as tg
+
+requires_cuda = pytest.mark.skipif(not tg.torch.cuda.is_available(), reason="CUDA not available")
+requires_cuda_bf16 = pytest.mark.skipif(
+    not tg.torch.cuda.is_available() or not tg.torch.cuda.is_bf16_supported(),
+    reason="CUDA bfloat16 not available",
+)
 
 
 @pytest.fixture()
@@ -416,3 +423,205 @@ def test_accumulation_does_not_reduce_optimizer_update_budget(test_assets: dict[
     assert "last_step=5" in proc.stdout
     payload = tg.torch.load(out_dir / "latest.pt", map_location="cpu", weights_only=False)
     assert payload["step"] == 5
+
+
+# --- Unit: RoPE helpers ---
+
+
+def test_unit_rotate_half_swaps_halves_and_negates() -> None:
+    x = tg.torch.tensor([1.0, 2.0, 3.0, 4.0])
+    y = tg.rotate_half(x)
+    tg.torch.testing.assert_close(y, tg.torch.tensor([-3.0, -4.0, 1.0, 2.0]))
+
+
+def test_unit_apply_rotary_pos_emb_identity_when_sin_is_zero() -> None:
+    B, H, T, D = 1, 2, 4, 8
+    q = tg.torch.randn(B, H, T, D)
+    k = tg.torch.randn(B, H, T, D)
+    cos = tg.torch.ones(1, 1, T, D)
+    sin = tg.torch.zeros(1, 1, T, D)
+    q2, k2 = tg.apply_rotary_pos_emb(q, k, cos, sin)
+    tg.torch.testing.assert_close(q2, q)
+    tg.torch.testing.assert_close(k2, k)
+
+
+def test_unit_rotary_embedding_output_shape_and_dtype() -> None:
+    rope = tg.RotaryEmbedding(dim=8, max_position_embeddings=32, base=10000.0)
+    cos, sin = rope.forward(7, dtype=tg.torch.bfloat16, device=tg.torch.device("cpu"))
+    assert cos.shape == (1, 1, 7, 8)
+    assert sin.shape == (1, 1, 7, 8)
+    assert cos.dtype == tg.torch.bfloat16
+    assert sin.dtype == tg.torch.bfloat16
+
+
+def test_unit_cuda_autocast_dtype_for_config() -> None:
+    base = tiny_cfg()
+    assert tg.cuda_autocast_dtype_for_config(base) == tg.torch.float16
+    assert tg.cuda_autocast_dtype_for_config(dataclasses.replace(base, amp_dtype="  BFLOAT16  ")) == tg.torch.bfloat16
+    assert tg.cuda_autocast_dtype_for_config(dataclasses.replace(base, amp_dtype="float16")) == tg.torch.float16
+
+
+def test_unit_gpt_state_dict_has_rotary_not_wpe() -> None:
+    cfg = tiny_cfg()
+    m = tg.GPT(cfg, vocab_size=50)
+    keys = set(m.state_dict().keys())
+    assert "transformer.wpe.weight" not in keys
+    assert hasattr(m, "rotary_emb")
+    # RoPE cos/sin caches use register_buffer(..., persistent=False) and are omitted from state_dict.
+    assert not any(k.startswith("rotary_emb.") for k in keys)
+
+
+def test_unit_gpt_rejects_odd_head_dim() -> None:
+    cfg = tiny_cfg(n_embd=30, n_head=2)
+    with pytest.raises(AssertionError, match="even head_dim"):
+        tg.GPT(cfg, vocab_size=50)
+
+
+# --- Integration: model + RoPE + backward ---
+
+
+def test_integration_gpt_forward_backward_with_gradient_checkpointing() -> None:
+    cfg = tiny_cfg(gradient_checkpointing=True, dropout=0.0)
+    m = tg.GPT(cfg, vocab_size=20)
+    m.train()
+    idx = tg.torch.randint(0, 20, (2, 6))
+    targets = tg.torch.randint(0, 20, (2, 6))
+    logits, loss = m(idx, targets)
+    assert logits.shape == (2, 6, 20)
+    assert loss is not None
+    loss.backward()
+    assert any(p.grad is not None for p in m.parameters())
+
+
+def test_integration_gpt_rope_base_changes_rotary_buffers() -> None:
+    cfg_a = tiny_cfg(rope_base=10000.0)
+    cfg_b = tiny_cfg(rope_base=5000.0)
+    a = tg.GPT(cfg_a, 10)
+    b = tg.GPT(cfg_b, 10)
+    assert not tg.torch.allclose(a.rotary_emb.cos_cached, b.rotary_emb.cos_cached)
+
+
+# --- Regression: checkpoint / layout contracts ---
+
+
+def test_regression_legacy_wpe_in_checkpoint_is_ignored_strict_false() -> None:
+    cfg = tiny_cfg()
+    m = tg.GPT(cfg, vocab_size=10)
+    state = m.state_dict()
+    polluted = {**state, "transformer.wpe.weight": tg.torch.zeros(cfg.block_size, cfg.n_embd)}
+    fresh = tg.GPT(cfg, vocab_size=10)
+    inc = fresh.load_state_dict(polluted, strict=False)
+    assert "transformer.wpe.weight" in inc.unexpected_keys
+    for k, v in state.items():
+        tg.torch.testing.assert_close(fresh.state_dict()[k], v)
+
+
+# --- Smoke / E2E: CLI flags for RoPE + checkpointing ---
+
+
+def test_smoke_cli_gradient_checkpointing_and_rope_base(test_assets: dict[str, Path], tmp_path: Path) -> None:
+    out_dir = tmp_path / "rope_cli"
+    proc = run_cli(
+        tmp_path,
+        "--device", "cpu",
+        "--data_dir", str(test_assets["data_dir"]),
+        "--data_format", "bin",
+        "--tokenizer", str(test_assets["tokenizer_json"]),
+        "--n_layer", "2",
+        "--n_head", "2",
+        "--n_embd", "32",
+        "--block_size", "8",
+        "--batch_size", "2",
+        "--max_iters", "2",
+        "--eval_interval", "1",
+        "--checkpoint_interval", "1",
+        "--sample_interval", "0",
+        "--gradient_checkpointing",
+        "--rope_base", "5000",
+        "--out_dir", str(out_dir),
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "rope_base" in proc.stdout
+    assert "[done]" in proc.stdout
+
+
+def test_e2e_generate_sample_text_roundtrip(test_assets: dict[str, Path]) -> None:
+    cfg = tiny_cfg(
+        data_dir=str(test_assets["data_dir"]),
+        data_format="bin",
+        tokenizer=str(test_assets["tokenizer_json"]),
+    )
+    tok = tg.build_tokenizer(str(test_assets["tokenizer_json"]), text=None, tiktoken_encoding="gpt2")
+    m = tg.GPT(cfg, tok.vocab_size)
+    m.eval()
+    out = tg.generate_sample_text(m, tok, tg.torch.device("cpu"), prompt="hello", max_new_tokens=3)
+    assert isinstance(out, str)
+
+
+# --- System-ish: CUDA AMP paths (hardware-dependent) ---
+
+
+@requires_cuda
+def test_system_cuda_train_step_amp_fp16_with_scaler(test_assets: dict[str, Path]) -> None:
+    cfg = tiny_cfg(
+        device="cuda",
+        amp=True,
+        amp_dtype="float16",
+        data_dir=str(test_assets["data_dir"]),
+        data_format="bin",
+        tokenizer=str(test_assets["tokenizer_json"]),
+    )
+    tok = tg.build_tokenizer(str(test_assets["tokenizer_json"]), text=None, tiktoken_encoding="gpt2")
+    train_ds, val_ds, _, _ = tg.prepare_datasets(cfg, tok)
+    train_loader, _, _ = tg.build_dataloaders(cfg, tg.torch.device("cuda"), train_ds, val_ds)
+    it = tg.batch_stream(train_loader)
+    model = tg.GPT(cfg, tok.vocab_size).to("cuda")
+    opt, _, _ = tg.build_optimizer(model, cfg, tg.torch.device("cuda"))
+    scaler = tg.torch.amp.GradScaler("cuda")
+    loss, gn = tg.train_step(model, it, tg.torch.device("cuda"), True, opt, scaler, cfg)
+    assert loss == loss and loss > 0
+    assert gn == gn and gn >= 0
+
+
+@requires_cuda_bf16
+def test_system_cuda_train_step_amp_bfloat16_without_scaler(test_assets: dict[str, Path]) -> None:
+    cfg = tiny_cfg(
+        device="cuda",
+        amp=True,
+        amp_dtype="bfloat16",
+        data_dir=str(test_assets["data_dir"]),
+        data_format="bin",
+        tokenizer=str(test_assets["tokenizer_json"]),
+    )
+    tok = tg.build_tokenizer(str(test_assets["tokenizer_json"]), text=None, tiktoken_encoding="gpt2")
+    train_ds, val_ds, _, _ = tg.prepare_datasets(cfg, tok)
+    train_loader, _, _ = tg.build_dataloaders(cfg, tg.torch.device("cuda"), train_ds, val_ds)
+    it = tg.batch_stream(train_loader)
+    model = tg.GPT(cfg, tok.vocab_size).to("cuda")
+    opt, _, _ = tg.build_optimizer(model, cfg, tg.torch.device("cuda"))
+    loss, gn = tg.train_step(model, it, tg.torch.device("cuda"), True, opt, None, cfg)
+    assert loss == loss and loss > 0
+    assert gn == gn and gn >= 0
+
+
+@requires_cuda_bf16
+def test_system_cuda_evaluate_respects_autocast_bfloat16(test_assets: dict[str, Path]) -> None:
+    cfg = tiny_cfg(
+        device="cuda",
+        data_dir=str(test_assets["data_dir"]),
+        data_format="bin",
+        tokenizer=str(test_assets["tokenizer_json"]),
+    )
+    tok = tg.build_tokenizer(str(test_assets["tokenizer_json"]), text=None, tiktoken_encoding="gpt2")
+    train_ds, val_ds, _, _ = tg.prepare_datasets(cfg, tok)
+    _, val_loader, _ = tg.build_dataloaders(cfg, tg.torch.device("cuda"), train_ds, val_ds)
+    model = tg.GPT(cfg, tok.vocab_size).to("cuda")
+    val = tg.evaluate(
+        model,
+        val_loader,
+        tg.torch.device("cuda"),
+        use_amp=True,
+        autocast_cuda_dtype=tg.torch.bfloat16,
+        max_batches=2,
+    )
+    assert val == val

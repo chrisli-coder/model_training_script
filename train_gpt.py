@@ -39,6 +39,7 @@ class TrainConfig:
     n_layer: int = 6
     n_head: int = 6
     n_embd: int = 384
+    rope_base: float = 10000.0
     block_size: int = 256
     dropout: float = 0.0
     bias: bool = True
@@ -67,6 +68,7 @@ class TrainConfig:
     num_workers: int = 0
     pin_memory: bool = True
     amp: bool = False
+    amp_dtype: str = "float16"
     gradient_checkpointing: bool = False
     optimizer_name: str = "adamw"
     optimizer_fallback: str = "fallback"
@@ -115,6 +117,7 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--n_layer", type=int, default=None)
     p.add_argument("--n_head", type=int, default=None)
     p.add_argument("--n_embd", type=int, default=None)
+    p.add_argument("--rope_base", type=float, default=None, help="RoPE theta (default 10000)")
     p.add_argument("--block_size", type=int, default=None)
     p.add_argument("--dropout", type=float, default=None)
     p.add_argument("--bias", type=lambda x: str(x).lower() in ("1", "true", "yes"), default=None)
@@ -148,6 +151,12 @@ def parse_cli() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--pin_memory", type=lambda x: str(x).lower() in ("1", "true", "yes"), default=None)
     p.add_argument("--amp", action="store_true", default=False)
+    p.add_argument(
+        "--amp_dtype",
+        type=str,
+        default=None,
+        help="CUDA autocast dtype when --amp: float16 (default) or bfloat16 (no GradScaler)",
+    )
     p.add_argument("--gradient_checkpointing", action="store_true", default=False)
     p.add_argument("--optimizer_name", type=str, default=None, help="adamw or adamw8bit")
     p.add_argument("--optimizer_fallback", type=str, default=None, help="fallback or strict")
@@ -652,6 +661,38 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, eps=1e-5)
 
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, max_position_embeddings: int, base: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_seq_len_cached = int(max_position_embeddings)
+        t = torch.arange(self.max_seq_len_cached, dtype=torch.float32, device=inv_freq.device)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, seq_len: int, *, dtype: torch.dtype, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos = self.cos_cached[:, :, :seq_len, :].to(device=device, dtype=dtype)
+        sin = self.sin_cached[:, :, :seq_len, :].to(device=device, dtype=dtype)
+        return cos, sin
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: TrainConfig, n_embd: int, n_head: int) -> None:
         super().__init__()
@@ -666,11 +707,18 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         B, T, C = x.shape
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        if rotary_emb is not None:
+            cos, sin = rotary_emb
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=self.attn_dropout.p if self.training else 0.0, is_causal=True
         )
@@ -700,8 +748,12 @@ class Block(nn.Module):
         self.ln2 = LayerNorm(n_embd, cfg.bias)
         self.mlp = MLP(cfg, n_embd)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), rotary_emb=rotary_emb)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -711,10 +763,16 @@ class GPT(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.vocab_size = int(vocab_size)
+        head_dim = cfg.n_embd // cfg.n_head
+        assert head_dim % 2 == 0, "RoPE requires even head_dim (n_embd // n_head)"
+        self.rotary_emb = RotaryEmbedding(
+            head_dim,
+            max_position_embeddings=cfg.block_size,
+            base=float(cfg.rope_base),
+        )
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(self.vocab_size, cfg.n_embd),
-                wpe=nn.Embedding(cfg.block_size, cfg.n_embd),
                 drop=nn.Dropout(cfg.dropout),
                 h=nn.ModuleList([Block(cfg, cfg.n_embd, cfg.n_head) for _ in range(cfg.n_layer)]),
                 ln_f=LayerNorm(cfg.n_embd, cfg.bias),
@@ -737,13 +795,14 @@ class GPT(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         b, t = idx.size()
         assert t <= self.cfg.block_size
-        pos = torch.arange(0, t, device=idx.device, dtype=torch.long)
-        x = self.transformer.drop(self.transformer.wte(idx) + self.transformer.wpe(pos))
+        x = self.transformer.drop(self.transformer.wte(idx))
+        cos, sin = self.rotary_emb(t, dtype=x.dtype, device=x.device)
+        rotary = (cos, sin)
         for block in self.transformer.h:
             if self.cfg.gradient_checkpointing and self.training and torch.is_grad_enabled():
-                x = activation_checkpoint(block, x, use_reentrant=False)
+                x = activation_checkpoint(block, x, rotary_emb=rotary, use_reentrant=False)
             else:
-                x = block(x)
+                x = block(x, rotary_emb=rotary)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -756,6 +815,13 @@ def count_parameters(model: nn.Module, trainable_only: bool = True) -> int:
     if trainable_only:
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
     return sum(p.numel() for p in model.parameters())
+
+
+def cuda_autocast_dtype_for_config(cfg: TrainConfig) -> torch.dtype:
+    """Dtype for torch.amp.autocast on CUDA when AMP is enabled (caller validates CUDA + cfg.amp)."""
+    if (cfg.amp_dtype or "").lower().strip() == "bfloat16":
+        return torch.bfloat16
+    return torch.float16
 
 
 def learning_rate_for_step(cfg: TrainConfig, step: int) -> float:
@@ -776,6 +842,7 @@ def evaluate(
     device: torch.device,
     *,
     use_amp: bool = False,
+    autocast_cuda_dtype: torch.dtype = torch.float16,
     max_batches: int = 50,
 ) -> float:
     model.eval()
@@ -786,7 +853,7 @@ def evaluate(
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         if use_amp and device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            with torch.amp.autocast(device_type="cuda", dtype=autocast_cuda_dtype):
                 _, loss = model(x, y)
         else:
             _, loss = model(x, y)
@@ -820,6 +887,7 @@ def train_step(
         x, y = next(batch_iter)
         x = x.to(device, non_blocking=pin_memory)
         y = y.to(device, non_blocking=pin_memory)
+        cuda_amp = cfg.amp and x.device.type == "cuda"
         if scaler is not None:
             with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                 _, loss = model(x, y)
@@ -827,6 +895,12 @@ def train_step(
             # Divide by accumulation_steps so the accumulated gradient matches the
             # mean gradient of one larger effective batch, rather than scaling it up.
             scaler.scale(loss / cfg.accumulation_steps).backward()
+        elif cuda_amp:
+            ad = cuda_autocast_dtype_for_config(cfg)
+            with torch.amp.autocast(device_type="cuda", dtype=ad):
+                _, loss = model(x, y)
+            loss_total += float(loss.item())
+            (loss / cfg.accumulation_steps).backward()
         else:
             _, loss = model(x, y)
             loss_total += float(loss.item())
@@ -952,7 +1026,14 @@ def load_checkpoint(
         payload = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         payload = torch.load(path, map_location=device)
-    model.load_state_dict(payload["model"])
+    # Old checkpoints (absolute position embeddings) include transformer.wpe.*;
+    # RoPE models omit them. strict=False drops unknown keys so resume still works.
+    inc = model.load_state_dict(payload["model"], strict=False)
+    if inc.unexpected_keys:
+        print(
+            f"[warn] checkpoint keys ignored (not in model): {inc.unexpected_keys}",
+            file=sys.stderr,
+        )
     try:
         optimizer.load_state_dict(payload["optimizer"])
     except Exception as exc:
@@ -1074,6 +1155,7 @@ def _config_groups() -> dict[str, list[str]]:
             "num_workers",
             "pin_memory",
             "amp",
+            "amp_dtype",
             "gradient_checkpointing",
         ],
         "training": [
@@ -1095,7 +1177,7 @@ def _config_groups() -> dict[str, list[str]]:
             "optimizer_name",
             "optimizer_fallback",
         ],
-        "model": ["n_layer", "n_head", "n_embd", "block_size", "dropout", "bias"],
+        "model": ["n_layer", "n_head", "n_embd", "rope_base", "block_size", "dropout", "bias"],
         "io": [
             "data_dir",
             "data_format",
@@ -1167,6 +1249,7 @@ def print_startup_report(
     lines.append(f"  n_val_tokens: {runtime.get('n_val_tokens', 'n/a')}")
     lines.append(f"  pin_memory_effective: {runtime.get('pin_memory_effective', 'n/a')}")
     lines.append(f"  amp_active: {runtime.get('amp_active', 'n/a')}")
+    lines.append(f"  amp_dtype_resolved: {runtime.get('amp_dtype_resolved', 'n/a')!r}")
     lines.append(f"  gradient_checkpointing_active: {runtime.get('gradient_checkpointing_active', 'n/a')}")
     lines.append(f"  accumulation_steps: {runtime.get('accumulation_steps', 'n/a')}")
     lines.append(f"  global_batch_tokens: {runtime.get('global_batch_tokens', 'n/a')}")
@@ -1242,6 +1325,13 @@ def main(args: argparse.Namespace) -> None:
     if cfg.n_embd % cfg.n_head != 0:
         print(f"[fatal] n_embd % n_head must be 0: {cfg.n_embd} {cfg.n_head}", file=sys.stderr)
         sys.exit(1)
+    head_dim = cfg.n_embd // cfg.n_head
+    if head_dim % 2 != 0:
+        print(
+            f"[fatal] RoPE requires even head_dim (n_embd // n_head); got {head_dim}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     out_dir = Path(cfg.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1252,6 +1342,26 @@ def main(args: argparse.Namespace) -> None:
     if cfg.amp and device.type != "cuda":
         print("[warn] AMP needs CUDA; disabling AMP.", file=sys.stderr)
         cfg = dataclasses.replace(cfg, amp=False)
+
+    amp_dtype_resolved = "n/a"
+    if cfg.amp and device.type == "cuda":
+        dtype_s = (cfg.amp_dtype or "float16").lower().strip()
+        if dtype_s not in ("float16", "bfloat16"):
+            print(f"[fatal] amp_dtype must be float16 or bfloat16, got {cfg.amp_dtype!r}", file=sys.stderr)
+            sys.exit(1)
+        if dtype_s == "bfloat16":
+            if torch.cuda.is_bf16_supported():
+                amp_dtype_resolved = "bfloat16"
+            else:
+                print(
+                    "[warn] amp_dtype=bfloat16 but this CUDA device does not support bfloat16; "
+                    "using float16 with GradScaler.",
+                    file=sys.stderr,
+                )
+                cfg = dataclasses.replace(cfg, amp_dtype="float16")
+                amp_dtype_resolved = "float16"
+        else:
+            amp_dtype_resolved = "float16"
 
     text_for_tokenizer: Optional[str] = None
     if cfg.data_format.lower().strip() == "text" and cfg.tokenizer.lower().strip() in ("char", "character") and not cfg.vocab_file:
@@ -1278,7 +1388,7 @@ def main(args: argparse.Namespace) -> None:
         print(optimizer_warning, file=sys.stderr)
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
     scaler: Optional[torch.amp.GradScaler] = None
-    if device.type == "cuda" and cfg.amp:
+    if device.type == "cuda" and cfg.amp and cuda_autocast_dtype_for_config(cfg) == torch.float16:
         scaler = torch.amp.GradScaler("cuda")
 
     step = 0
@@ -1305,6 +1415,7 @@ def main(args: argparse.Namespace) -> None:
         **split_info,
         "pin_memory_effective": pin_effective,
         "amp_active": bool(cfg.amp),
+        "amp_dtype_resolved": amp_dtype_resolved,
         "gradient_checkpointing_active": bool(cfg.gradient_checkpointing),
         "accumulation_steps": int(cfg.accumulation_steps),
         "global_batch_tokens": int(cfg.batch_size * cfg.accumulation_steps * cfg.block_size),
@@ -1345,7 +1456,13 @@ def main(args: argparse.Namespace) -> None:
             rng_state = collect_rng_state(device)
 
             if step % cfg.eval_interval == 0 or step == 1:
-                val_loss = evaluate(model, val_loader, device, use_amp=bool(cfg.amp))
+                val_loss = evaluate(
+                    model,
+                    val_loader,
+                    device,
+                    use_amp=bool(cfg.amp),
+                    autocast_cuda_dtype=cuda_autocast_dtype_for_config(cfg),
+                )
                 ppl = math.exp(val_loss) if val_loss == val_loss else float("nan")
                 elapsed = time.time() - t0
                 now_wall = time.time()
