@@ -349,7 +349,14 @@ def collect_rng_state(device: torch.device) -> dict[str, Any]:
 
 
 def restore_rng_state(state: dict[str, Any], device: torch.device) -> None:
-    torch.set_rng_state(state["torch"])
+    # torch.set_rng_state expects a CPU ByteTensor; torch.load(map_location=...) can
+    # leave RNG buffers on GPU or with an unexpected dtype in some setups.
+    ts = state["torch"]
+    if isinstance(ts, torch.Tensor):
+        ts = ts.cpu().contiguous()
+        if ts.dtype != torch.uint8:
+            raise TypeError(f"torch RNG state has dtype {ts.dtype}, expected torch.uint8 (torch.ByteTensor)")
+    torch.set_rng_state(ts)
     np.random.set_state(state["numpy"])
     random.setstate(state["random"])
     if device.type == "cuda" and state.get("cuda") is not None:
@@ -1009,7 +1016,22 @@ def save_checkpoint(
         "scaler": scaler.state_dict() if scaler else None,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        torch.save(payload, tmp_path)
+        # On POSIX, os.replace overwrites an existing file atomically. On Windows,
+        # some environments still surface FileExistsError when clobbering; remove
+        # the destination first only there so resume/save keeps working.
+        if sys.platform == "win32" and path.is_file():
+            path.unlink()
+        tmp_path.replace(path)
+    except Exception:
+        try:
+            if tmp_path.is_file():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def load_checkpoint(
@@ -1047,7 +1069,14 @@ def load_checkpoint(
     if scaler is not None and payload.get("scaler") is not None:
         scaler.load_state_dict(payload["scaler"])
     if payload.get("rng"):
-        restore_rng_state(payload["rng"], device)
+        try:
+            restore_rng_state(payload["rng"], device)
+        except Exception as exc:
+            print(
+                "[warn] could not restore RNG state from checkpoint (training continues; "
+                f"shuffle/noise may differ from the original run): {exc}",
+                file=sys.stderr,
+            )
     return payload
 
 
